@@ -1,0 +1,14 @@
+.env
+devex_session.json
+service_account.json
+venv/
+__pycache__/
+*.pyc
+audit.log
+failed_records.jsonvenv/
+.env
+__pycache__/
+*.pyc
+.hypothesis/
+.pytest_cache/
+audit.log
