@@ -1,11 +1,12 @@
 """UNDPAdapter — scrapes UNDP Procurement Notices portal.
 
-v2: Bounded concurrency detail-page fetching, heading-based Overview extraction,
-full-text keyword matching (not truncated), adapter-level timeout.
+v3: Unified _matching_text, shared httpx client, retry/backoff for transient errors,
+bounded concurrency, explicit task management for timeout preservation.
 """
 import asyncio
 import hashlib
 import logging
+import random
 import re
 from datetime import date, datetime
 from typing import Optional
@@ -14,20 +15,25 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 
-from engine.keyword_filter import KeywordFilter
+from engine.keyword_filter import MATCHING_TEXT_KEY, KeywordFilter
 from portals.base_adapter import BasePortalAdapter
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://procurement-notices.undp.org"
 
-# LATAM region class applied by UNDP to each <a> card
 _LATAM_REGION_CLASS = "region_RLA"
 
-# Concurrency settings
+# Concurrency and timeout settings
 _MAX_CONCURRENT_DETAIL_FETCHES = 8
-_DETAIL_REQUEST_TIMEOUT = 12  # seconds per detail page
-_ADAPTER_LEVEL_TIMEOUT = 120  # seconds — entire adapter run must complete within this
+_DETAIL_REQUEST_TIMEOUT = 12  # seconds per individual request attempt
+_ADAPTER_LEVEL_TIMEOUT = 120  # seconds — entire adapter must complete within this
+
+# Retry settings — only for transient failures
+_MAX_ATTEMPTS = 3
+_BASE_BACKOFF = 0.5  # seconds — multiplied by 2^attempt with jitter
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_PERMANENT_FAIL_STATUS_CODES = {400, 401, 403, 404}
 
 # Display/storage truncation (NOT used for keyword matching)
 _DESCRIPTION_DISPLAY_MAX = 1000
@@ -88,7 +94,7 @@ def _extract_overview_from_detail(html: str) -> Optional[str]:
             return text if text else None
 
     # Fallback: longest block heuristic
-    logger.info("[undp] Overview heading not found — using longest postContent block (fallback)")
+    logger.warning("[undp] Overview heading not found — using longest postContent block (fallback)")
     best = max(content_divs, key=lambda d: len(d.get_text()))
     text = best.get_text(" ", strip=True)
     return text if text else None
@@ -114,132 +120,192 @@ class UNDPAdapter(BasePortalAdapter):
             return False
 
     async def fetch_opportunities(self) -> list[dict]:
-        """Fetch UNDP notices with bounded-concurrency detail enrichment."""
+        """Fetch UNDP notices with bounded concurrency and deadline-preserving timeout."""
         if not getattr(self.config, "undp_enabled", True):
             print("[UNDP] Adapter disabled — skipping")
             return []
-
-        try:
-            return await asyncio.wait_for(
-                self._run(), timeout=_ADAPTER_LEVEL_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            print(f"[UNDP] Adapter timed out after {_ADAPTER_LEVEL_TIMEOUT}s")
-            logger.error("[undp] Adapter-level timeout reached (%ds)", _ADAPTER_LEVEL_TIMEOUT)
-            return []
+        return await self._run()
 
     async def _run(self) -> list[dict]:
-        """Core logic — separated so wait_for can wrap it."""
+        """Core logic with explicit task management for timeout preservation."""
         url = f"{BASE_URL}/"
         print(f"[UNDP] Requesting listing: {url}")
 
-        # Fetch listing page
-        async with httpx.AsyncClient(timeout=30) as client:
+        # One shared client for the entire adapter run
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_DETAIL_REQUEST_TIMEOUT, connect=10),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            # Fetch listing page
             try:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = await client.get(url)
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
                 self._log_error(exc, detail="listing page fetch failed")
                 print(f"[UNDP] ERROR: listing fetch failed — {exc}")
                 return []
 
-        print(f"[UNDP] Listing size: {len(resp.text)} chars")
-        soup = BeautifulSoup(resp.text, "lxml")
+            print(f"[UNDP] Listing size: {len(resp.text)} chars")
+            soup = BeautifulSoup(resp.text, "lxml")
 
-        table = soup.find("div", class_="vacanciesTable")
-        if not table:
-            print("[UNDP] ERROR: div.vacanciesTable not found")
-            return []
+            table = soup.find("div", class_="vacanciesTable")
+            if not table:
+                print("[UNDP] ERROR: div.vacanciesTable not found")
+                return []
 
-        all_cards = table.find_all("a", class_="vacanciesTable__row")
-        latam_cards = [c for c in all_cards if _LATAM_REGION_CLASS in (c.get("class") or [])]
-        cards_to_parse = latam_cards if latam_cards else all_cards
-        print(f"[UNDP] Total cards: {len(all_cards)} | LATAM: {len(latam_cards)} | Parsing: {len(cards_to_parse)}")
+            all_cards = table.find_all("a", class_="vacanciesTable__row")
+            latam_cards = [c for c in all_cards if _LATAM_REGION_CLASS in (c.get("class") or [])]
+            cards_to_parse = latam_cards if latam_cards else all_cards
+            print(f"[UNDP] Total: {len(all_cards)} | LATAM: {len(latam_cards)} | Parsing: {len(cards_to_parse)}")
 
-        # Parse basic card info
-        parsed_cards: list[dict] = []
-        for card in cards_to_parse:
-            opp = self._parse_card(card)
-            if opp:
-                parsed_cards.append(opp)
+            # Parse basic card info
+            parsed_cards = [self._parse_card(c) for c in cards_to_parse]
+            parsed_cards = [o for o in parsed_cards if o]
 
-        # Skip expired records BEFORE fetching detail pages (spec AC 1)
-        today = date.today()
-        active_cards: list[dict] = []
-        expired_count = 0
-        for opp in parsed_cards:
-            dl = opp.get("deadline")
-            if dl:
-                try:
-                    if date.fromisoformat(dl) < today:
-                        expired_count += 1
-                        continue
-                except ValueError:
-                    pass
-            active_cards.append(opp)
+            # Skip expired BEFORE detail fetches
+            today = date.today()
+            active_cards: list[dict] = []
+            expired_count = 0
+            for opp in parsed_cards:
+                dl = opp.get("deadline")
+                if dl:
+                    try:
+                        if date.fromisoformat(dl) < today:
+                            expired_count += 1
+                            continue
+                    except ValueError:
+                        pass
+                active_cards.append(opp)
 
-        if expired_count:
-            print(f"[UNDP] Skipped {expired_count} expired records before detail fetch")
-        print(f"[UNDP] Active cards to enrich: {len(active_cards)}")
+            if expired_count:
+                print(f"[UNDP] Skipped {expired_count} expired before detail fetch")
+            print(f"[UNDP] Active cards to enrich: {len(active_cards)}")
 
-        # Fetch detail pages with bounded concurrency
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DETAIL_FETCHES)
-        detail_fetched = 0
-        detail_fallback = 0
+            # Bounded-concurrency detail enrichment with explicit deadline
+            semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DETAIL_FETCHES)
+            deadline = asyncio.get_event_loop().time() + _ADAPTER_LEVEL_TIMEOUT
 
-        async def enrich_one(opp: dict) -> None:
-            nonlocal detail_fetched, detail_fallback
-            detail_url = opp.get("opportunity_link", "")
-            if not detail_url or detail_url == BASE_URL:
-                detail_fallback += 1
-                return
-            async with semaphore:
-                try:
-                    async with httpx.AsyncClient(timeout=_DETAIL_REQUEST_TIMEOUT) as client:
-                        dr = await client.get(detail_url, headers={"User-Agent": "Mozilla/5.0"})
-                        dr.raise_for_status()
-                    overview = _extract_overview_from_detail(dr.text)
+            async def enrich_one(opp: dict) -> bool:
+                """Enrich one opportunity. Returns True if detail fetched successfully."""
+                detail_url = opp.get("opportunity_link", "")
+                if not detail_url or detail_url == BASE_URL:
+                    return False
+                async with semaphore:
+                    overview = await self._fetch_detail_with_retry(client, detail_url)
                     if overview:
-                        # Full text for keyword matching (spec AC 2)
-                        opp["_full_overview"] = overview
-                        # Truncated version for display/sheet
+                        opp[MATCHING_TEXT_KEY] = overview
                         opp["description_snippet"] = overview[:_DESCRIPTION_DISPLAY_MAX]
-                        detail_fetched += 1
-                    else:
-                        detail_fallback += 1
-                except Exception as exc:
-                    logger.warning("[undp] Detail fetch failed for %s: %s", detail_url, exc)
-                    detail_fallback += 1
+                        return True
+                    return False
 
-        await asyncio.gather(*[enrich_one(opp) for opp in active_cards])
-        print(f"[UNDP] Detail pages: fetched={detail_fetched}, fallback={detail_fallback}")
+            # Create tasks and wait with timeout
+            tasks = [asyncio.create_task(enrich_one(opp)) for opp in active_cards]
 
-        # Apply keyword filter using FULL overview text (spec AC 2)
+            # Wait for all tasks but respect the adapter deadline
+            remaining_time = max(0, deadline - asyncio.get_event_loop().time())
+            done, pending = await asyncio.wait(tasks, timeout=remaining_time)
+
+            # Cancel and await pending tasks cleanly
+            cancelled_count = 0
+            for task in pending:
+                task.cancel()
+                cancelled_count += 1
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            # Count results
+            detail_fetched = sum(1 for t in done if not t.cancelled() and t.result())
+            detail_fallback = len(active_cards) - detail_fetched
+
+            if cancelled_count:
+                logger.warning(
+                    "[undp] Adapter deadline reached: total=%d, completed=%d, "
+                    "fallback=%d, cancelled=%d — run incomplete",
+                    len(active_cards), detail_fetched,
+                    detail_fallback - cancelled_count, cancelled_count,
+                )
+                print(f"[UNDP] WARN: deadline reached — {cancelled_count} tasks cancelled, "
+                      f"{detail_fetched} completed")
+            else:
+                print(f"[UNDP] Detail pages: fetched={detail_fetched}, fallback={detail_fallback}")
+
+        # Apply keyword filter — uses _matching_text when present (no mutation needed)
         keyword_filter = KeywordFilter(self.config)
         filtered: list[dict] = []
         for opp in active_cards:
-            # Use full overview for matching if available
-            full_overview = opp.get("_full_overview")
-            original_snippet = opp.get("description_snippet", "")
-
-            if full_overview:
-                # Temporarily set full text for filter check
-                opp["description_snippet"] = full_overview
-
             if keyword_filter.passes_filter(opp):
-                # Keep _full_overview in the dict for downstream get_matched_keywords()
-                # Store truncated version as description_snippet for display/sheet
-                opp["description_snippet"] = full_overview[:_DESCRIPTION_DISPLAY_MAX] if full_overview else original_snippet
                 filtered.append(opp)
-            else:
-                # Not matched — restore original and discard
-                opp["description_snippet"] = original_snippet
 
         print(f"[UNDP] Passed keyword filter: {len(filtered)}")
         if filtered:
             print(f"[UNDP] Sample: {filtered[0].get('opportunity_title', '')[:70]}")
 
         return filtered[: self.config.max_results]
+
+    async def _fetch_detail_with_retry(
+        self, client: httpx.AsyncClient, url: str
+    ) -> Optional[str]:
+        """Fetch a detail page with bounded retry for transient failures.
+
+        Returns the extracted Overview text or None on permanent failure.
+        """
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                resp = await client.get(url)
+
+                # Permanent failure — do not retry
+                if resp.status_code in _PERMANENT_FAIL_STATUS_CODES:
+                    logger.warning(
+                        "[undp] Permanent %d for %s — no retry", resp.status_code, url
+                    )
+                    return None
+
+                # Retryable status
+                if resp.status_code in _RETRYABLE_STATUS_CODES:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and attempt < _MAX_ATTEMPTS:
+                        try:
+                            wait = min(float(retry_after), _ADAPTER_LEVEL_TIMEOUT / 4)
+                        except ValueError:
+                            wait = _BASE_BACKOFF * (2 ** (attempt - 1))
+                        await asyncio.sleep(wait)
+                        continue
+                    if attempt < _MAX_ATTEMPTS:
+                        backoff = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                        await asyncio.sleep(backoff)
+                        continue
+                    logger.warning(
+                        "[undp] Exhausted %d attempts for %s (last status=%d)",
+                        _MAX_ATTEMPTS, url, resp.status_code,
+                    )
+                    return None
+
+                resp.raise_for_status()
+                return _extract_overview_from_detail(resp.text)
+
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                if attempt < _MAX_ATTEMPTS:
+                    backoff = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                    logger.info(
+                        "[undp] Transient error for %s (attempt %d/%d): %s — retrying in %.1fs",
+                        url, attempt, _MAX_ATTEMPTS, exc, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(
+                        "[undp] Exhausted %d attempts for %s: %s",
+                        _MAX_ATTEMPTS, url, exc,
+                    )
+                    return None
+            except httpx.HTTPStatusError as exc:
+                # Unexpected status error — treat as non-retryable
+                logger.warning("[undp] HTTP error for %s: %s", url, exc)
+                return None
+            except Exception as exc:
+                logger.warning("[undp] Unexpected error for %s: %s", url, exc)
+                return None
+
+        return None
 
     def _parse_card(self, card) -> Optional[dict]:
         """Parse a single listing-page card into a basic Opportunity_Dict."""

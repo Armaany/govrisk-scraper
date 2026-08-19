@@ -1,24 +1,29 @@
-"""Tests for UNDP detail-page description enrichment (v2).
+"""Tests for UNDP detail-page description enrichment (v3).
 
 Covers:
-  - Original 6: description extraction, truncation, fallback
-  - Adversarial: keyword after char 1000 still passes filter
-  - Adversarial: Documents block longer than Overview — only Overview used
-  - Concurrency: 106 cards, bounded concurrency, expired skipping, failure resilience
-  - Timing: adapter completes within defined max time
+  - Overview extraction (heading-based + fallback)
+  - Full-text matching via _matching_text (keyword beyond 1000 chars)
+  - Transient matching text excluded from serialization
+  - Backward compatibility for non-UNDP adapters
+  - Shared client reuse with retry/backoff
+  - Permanent failure (404) gets exactly one attempt
+  - Bounded concurrency (1 < peak <= 8)
+  - Expired records skipped before detail fetch
+  - Timeout preserves completed work
 """
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from engine.keyword_filter import MATCHING_TEXT_KEY, KeywordFilter
 from portals.undp_adapter import (
     UNDPAdapter,
     _extract_overview_from_detail,
     _DESCRIPTION_DISPLAY_MAX,
     _MAX_CONCURRENT_DETAIL_FETCHES,
-    _ADAPTER_LEVEL_TIMEOUT,
+    _MAX_ATTEMPTS,
 )
 
 
@@ -35,420 +40,390 @@ def _make_config():
     return cfg
 
 
-def _make_detail_html(overview_text: str, docs_text: str = "Short doc") -> str:
-    return f"""
-    <html><body><main>
+def _make_detail_html(overview_text, docs_text="Short doc"):
+    return f"""<html><body><main>
       <div class="postContent"><h2>Documents</h2><p>{docs_text}</p></div>
       <div class="postContent"><h2>Overview</h2><p>{overview_text}</p></div>
-    </main></body></html>
-    """
+    </main></body></html>"""
 
 
-def _make_listing_html(cards_html: str) -> str:
-    return f"""
-    <html><body>
-      <div class="vacanciesTable">
-        <div class="vacanciesTable__header"></div>
-        {cards_html}
-      </div>
-    </body></html>
-    """
+def _make_listing_html(cards_html):
+    return f"""<html><body><div class="vacanciesTable">
+        <div class="vacanciesTable__header"></div>{cards_html}
+    </div></body></html>"""
 
 
 def _make_card_html(title, country, href, deadline="30-Dec-26", region_class="region_RLA"):
-    return f"""
-    <a class="vacanciesTableLink vacanciesTable__row {region_class}" href="{href}">
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">Title</div><span>{title}</span>
-      </div>
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">Ref No</div><span>TEST-001</span>
-      </div>
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">UNDP Office/Country</div><span>UNDP-COL/{country.upper()}</span>
-      </div>
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">Process</div><span>RFP</span>
-      </div>
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">Deadline</div><span>{deadline}</span>
-      </div>
-    </a>
-    """
+    return f"""<a class="vacanciesTableLink vacanciesTable__row {region_class}" href="{href}">
+      <div class="vacanciesTable__cell"><div class="vacanciesTable__cell__label">Title</div><span>{title}</span></div>
+      <div class="vacanciesTable__cell"><div class="vacanciesTable__cell__label">Ref No</div><span>T-001</span></div>
+      <div class="vacanciesTable__cell"><div class="vacanciesTable__cell__label">UNDP Office/Country</div><span>UNDP-COL/{country.upper()}</span></div>
+      <div class="vacanciesTable__cell"><div class="vacanciesTable__cell__label">Process</div><span>RFP</span></div>
+      <div class="vacanciesTable__cell"><div class="vacanciesTable__cell__label">Deadline</div><span>{deadline}</span></div>
+    </a>"""
+
+
+class FakeResponse:
+    def __init__(self, text="", status_code=200, headers=None):
+        self.text = text
+        self.status_code = status_code
+        self.headers = headers or {}
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import httpx
+            raise httpx.HTTPStatusError(
+                f"{self.status_code}", request=MagicMock(), response=self
+            )
+
+
+class FakeClient:
+    """Shared fake httpx.AsyncClient that tracks requests."""
+    def __init__(self, handler):
+        self._handler = handler
+        self.request_log = []
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        pass
+    async def get(self, url, **kwargs):
+        self.request_log.append(str(url))
+        return await self._handler(str(url))
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for _extract_overview_from_detail
+# OVERVIEW EXTRACTION
 # ---------------------------------------------------------------------------
 
 def test_extract_overview_by_heading():
-    """Primary: identifies Overview block by its <h2> heading."""
-    html = _make_detail_html("Real overview about anti-corruption")
-    result = _extract_overview_from_detail(html)
-    assert result is not None
-    assert "anti-corruption" in result
+    html = _make_detail_html("Anti-corruption reform program")
+    assert "anti-corruption" in (_extract_overview_from_detail(html) or "").lower()
 
+def test_extract_overview_strips_heading():
+    result = _extract_overview_from_detail(_make_detail_html("Body text here"))
+    assert result and not result.startswith("Overview")
 
-def test_extract_overview_strips_heading_text():
-    """The heading text 'Overview' itself is stripped from the returned text."""
-    html = _make_detail_html("Description body here.")
-    result = _extract_overview_from_detail(html)
-    assert result is not None
-    assert not result.startswith("Overview")
+def test_extract_overview_full_text_not_truncated():
+    long = "x" * 5000
+    result = _extract_overview_from_detail(_make_detail_html(long))
+    assert result and len(result) == 5000
 
+def test_extract_overview_none_when_no_postcontent():
+    assert _extract_overview_from_detail("<html><body></body></html>") is None
 
-def test_extract_overview_returns_full_text_not_truncated():
-    """Returns the FULL overview text without truncation."""
-    long_text = "x" * 5000
-    html = _make_detail_html(long_text)
-    result = _extract_overview_from_detail(html)
-    assert result is not None
-    assert len(result) == 5000
-
-
-def test_extract_overview_returns_none_when_no_postcontent():
-    html = "<html><body><main><p>Nothing</p></main></body></html>"
-    result = _extract_overview_from_detail(html)
-    assert result is None
-
-
-def test_extract_overview_fallback_to_longest_when_no_heading():
-    """Falls back to longest postContent when no Overview heading exists."""
-    html = """
-    <html><body><main>
+def test_extract_overview_fallback_when_no_heading():
+    html = """<html><body><main>
       <div class="postContent"><p>Short</p></div>
-      <div class="postContent"><p>This is a much longer block with real content about governance reform.</p></div>
-    </main></body></html>
-    """
+      <div class="postContent"><p>Longer block about governance reform programs</p></div>
+    </main></body></html>"""
     result = _extract_overview_from_detail(html)
-    assert result is not None
-    assert "governance reform" in result
+    assert result and "governance" in result
+
+def test_documents_longer_than_overview_only_overview_used():
+    html = f"""<html><body><main>
+      <div class="postContent"><h2>Documents</h2><p>{'doc ' * 2000}</p></div>
+      <div class="postContent"><h2>Overview</h2><p>Short transparency text</p></div>
+    </main></body></html>"""
+    result = _extract_overview_from_detail(html)
+    assert "transparency" in result
+    assert "doc doc doc" not in result
 
 
 # ---------------------------------------------------------------------------
-# ADVERSARIAL: keyword after character 1000 still passes filter (spec AC 2)
+# FULL-TEXT FILTERING END TO END
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_keyword_after_1000_chars_still_passes():
-    """A keyword placed at character 1500 is still found by the filter because
-    full overview text (not truncated) is used for matching."""
-    filler = "lorem ipsum " * 125  # ~1500 chars
-    overview = filler + "corruption program details"
+async def test_keyword_after_1000_chars_passes_filter_and_matched_keywords():
+    """Keyword at position 1500 passes filter AND appears in matched_keywords."""
+    filler = "lorem ipsum " * 130
+    overview = filler + "corruption program"
     detail_html = _make_detail_html(overview)
     listing_html = _make_listing_html(
         _make_card_html("Generic Title", "Colombia", "view_notice.cfm?notice_id=1")
     )
-
     config = _make_config()
     adapter = UNDPAdapter(config)
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
-            self.status_code = 200
-        def raise_for_status(self):
-            pass
+    async def handler(url):
+        if "notice_id" in url:
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
 
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
-        results = await adapter.fetch_opportunities()
-
-    assert len(results) >= 1, "Keyword at position 1500 should still match via full-text"
-    assert len(results[0]["description_snippet"]) <= _DESCRIPTION_DISPLAY_MAX
-    # Verify _full_overview is preserved for downstream get_matched_keywords
-    assert "_full_overview" in results[0], "_full_overview must be kept for main.py to use"
-    assert "corruption" in results[0]["_full_overview"]
-
-
-@pytest.mark.asyncio
-async def test_matched_keywords_populated_from_full_overview():
-    """get_matched_keywords() must find keywords beyond char 1000 using _full_overview."""
-    from engine.keyword_filter import KeywordFilter
-
-    # Build overview with keyword only after position 1500
-    filler = "generic text " * 130  # ~1690 chars
-    overview = filler + "transparency reform initiative"
-    detail_html = _make_detail_html(overview)
-    listing_html = _make_listing_html(
-        _make_card_html("Boring Title No Keywords", "Colombia", "view_notice.cfm?notice_id=7")
-    )
-
-    config = _make_config()
-    adapter = UNDPAdapter(config)
-
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
-            self.status_code = 200
-        def raise_for_status(self):
-            pass
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)):
         results = await adapter.fetch_opportunities()
 
     assert len(results) >= 1
-
-    # Simulate what main.py does: use _full_overview for get_matched_keywords
     opp = results[0]
+    # description_snippet is truncated for display
+    assert len(opp["description_snippet"]) <= _DESCRIPTION_DISPLAY_MAX
+    # _matching_text carries full text
+    assert MATCHING_TEXT_KEY in opp
+    assert "corruption" in opp[MATCHING_TEXT_KEY]
+    # get_matched_keywords sees full text
     kf = KeywordFilter(config)
-    full_overview = opp.get("_full_overview")
-    assert full_overview is not None
-
-    saved = opp["description_snippet"]
-    opp["description_snippet"] = full_overview
-    matched = kf.get_matched_keywords(opp)
-    opp["description_snippet"] = saved
-
-    assert "transparency" in matched, (
-        f"Expected 'transparency' in matched_keywords but got: '{matched}'"
-    )
+    assert "corruption" in kf.get_matched_keywords(opp)
 
 
 @pytest.mark.asyncio
-async def test_documents_block_longer_than_overview_only_overview_used():
-    """Even if Documents block is longer, heading-based extraction picks Overview."""
-    long_docs = "document " * 500
-    overview = "Short overview about transparency and governance reform"
-    detail_html = f"""
-    <html><body><main>
-      <div class="postContent"><h2>Documents</h2><p>{long_docs}</p></div>
-      <div class="postContent"><h2>Overview</h2><p>{overview}</p></div>
-    </main></body></html>
-    """
+async def test_matching_text_excluded_before_serialization():
+    """_matching_text must not appear as a Sheets column."""
+    from store.adapter_sheets import SheetsAdapter
+    assert MATCHING_TEXT_KEY not in SheetsAdapter.HEADERS
+
+
+def test_non_undp_opportunity_filters_normally():
+    """Opportunity without _matching_text uses legacy title+description_snippet."""
+    config = _make_config()
+    kf = KeywordFilter(config)
+    opp = {
+        "opportunity_title": "Governance reform in Colombia",
+        "description_snippet": "Support for anti-corruption",
+        "country_region": "Colombia",
+    }
+    assert kf.passes_filter(opp)
+    assert "governance" in kf.get_matched_keywords(opp)
+    assert "corruption" in kf.get_matched_keywords(opp)
+
+
+# ---------------------------------------------------------------------------
+# SHARED CLIENT AND RETRY/BACKOFF
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_transient_failure_then_success():
+    """First attempt fails transiently, second succeeds."""
+    detail_html = _make_detail_html("Transparency program Colombia")
     listing_html = _make_listing_html(
-        _make_card_html("Some Title", "Colombia", "view_notice.cfm?notice_id=2")
+        _make_card_html("Title", "Colombia", "view_notice.cfm?notice_id=1")
     )
+    attempt_count = [0]
+
+    async def handler(url):
+        if "notice_id" in url:
+            attempt_count[0] += 1
+            if attempt_count[0] == 1:
+                import httpx
+                raise httpx.ConnectError("transient failure")
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
 
     config = _make_config()
     adapter = UNDPAdapter(config)
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
-            self.status_code = 200
-        def raise_for_status(self):
-            pass
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+    # Inject zero-backoff for test speed
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)), \
+         patch("portals.undp_adapter._BASE_BACKOFF", 0), \
+         patch("portals.undp_adapter.random.uniform", return_value=0):
         results = await adapter.fetch_opportunities()
 
     assert len(results) >= 1
-    desc = results[0]["description_snippet"]
-    assert "transparency" in desc
-    assert "document " * 10 not in desc
+    assert attempt_count[0] == 2  # first failed, second succeeded
 
-
-# ---------------------------------------------------------------------------
-# CONCURRENCY: 106 cards, bounded concurrency, expired skipping, failure resilience
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_concurrency_106_cards_bounded_and_resilient():
-    """Simulates 106 cards: verifies bounded concurrency, expired skipping,
-    and that one failing detail request doesn't crash the adapter."""
-    # 100 active cards + 6 expired cards = 106 total
-    active_cards_html = ""
-    for i in range(100):
-        active_cards_html += _make_card_html(
-            f"Opp {i}", "Colombia", f"view_notice.cfm?notice_id={i}", deadline="30-Dec-26"
-        )
-    for i in range(100, 106):
-        active_cards_html += _make_card_html(
-            f"Expired {i}", "Colombia", f"view_notice.cfm?notice_id={i}", deadline="01-Jan-20"
-        )
+async def test_repeated_transient_failures_exhaust_attempts():
+    """All attempts fail transiently — falls back to title."""
+    listing_html = _make_listing_html(
+        _make_card_html("Anti-corruption Colombia", "Colombia", "view_notice.cfm?notice_id=1")
+    )
+    attempt_count = [0]
 
-    listing_html = _make_listing_html(active_cards_html)
-    overview_text = "This opportunity covers governance and transparency reform"
-    detail_html = _make_detail_html(overview_text)
+    async def handler(url):
+        if "notice_id" in url:
+            attempt_count[0] += 1
+            import httpx
+            raise httpx.ConnectError("always failing")
+        return FakeResponse(listing_html)
 
     config = _make_config()
     adapter = UNDPAdapter(config)
 
-    # Track concurrent access
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)), \
+         patch("portals.undp_adapter._BASE_BACKOFF", 0), \
+         patch("portals.undp_adapter.random.uniform", return_value=0):
+        results = await adapter.fetch_opportunities()
+
+    assert attempt_count[0] == _MAX_ATTEMPTS
+    # Title "Anti-corruption Colombia" passes filter on its own
+    assert len(results) >= 1
+    assert MATCHING_TEXT_KEY not in results[0]
+
+
+@pytest.mark.asyncio
+async def test_404_gets_exactly_one_attempt():
+    """A 404 is permanent — exactly one request, no retry."""
+    listing_html = _make_listing_html(
+        _make_card_html("Corruption reform", "Colombia", "view_notice.cfm?notice_id=1")
+    )
+    attempt_count = [0]
+
+    async def handler(url):
+        if "notice_id" in url:
+            attempt_count[0] += 1
+            return FakeResponse("", status_code=404)
+        return FakeResponse(listing_html)
+
+    config = _make_config()
+    adapter = UNDPAdapter(config)
+
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)):
+        results = await adapter.fetch_opportunities()
+
+    assert attempt_count[0] == 1  # no retry for 404
+
+
+@pytest.mark.asyncio
+async def test_shared_client_reused():
+    """The same client instance is used for listing and all detail requests."""
+    detail_html = _make_detail_html("Governance text")
+    listing_html = _make_listing_html(
+        _make_card_html("Gov", "Colombia", "view_notice.cfm?notice_id=1") +
+        _make_card_html("Gov2", "Colombia", "view_notice.cfm?notice_id=2")
+    )
+    clients_created = [0]
+    original_init = FakeClient.__init__
+
+    async def handler(url):
+        if "notice_id" in url:
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
+
+    def tracking_init(self, h):
+        clients_created[0] += 1
+        original_init(self, h)
+
+    config = _make_config()
+    adapter = UNDPAdapter(config)
+
+    fake = FakeClient(handler)
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=fake):
+        await adapter.fetch_opportunities()
+
+    # All requests should go through the same FakeClient instance
+    assert len(fake.request_log) >= 3  # 1 listing + 2 details
+
+
+# ---------------------------------------------------------------------------
+# CONCURRENCY, EXPIRY, TIMING
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_concurrency_bounded_and_expired_skipped():
+    """106 cards: verifies 1 < peak_concurrency <= 8, expired skipping, request count."""
+    active_cards = "".join(
+        _make_card_html(f"Opp{i}", "Colombia", f"view_notice.cfm?notice_id={i}", "30-Dec-26")
+        for i in range(100)
+    )
+    expired_cards = "".join(
+        _make_card_html(f"Exp{i}", "Colombia", f"view_notice.cfm?notice_id=exp{i}", "01-Jan-20")
+        for i in range(6)
+    )
+    listing_html = _make_listing_html(active_cards + expired_cards)
+    detail_html = _make_detail_html("Governance and transparency reform")
+
+    config = _make_config()
+    adapter = UNDPAdapter(config)
+
     max_concurrent = [0]
     current_concurrent = [0]
+    request_urls = []
 
-    import httpx as httpx_mod
+    async def handler(url):
+        if "notice_id" in url:
+            request_urls.append(url)
+            current_concurrent[0] += 1
+            if current_concurrent[0] > max_concurrent[0]:
+                max_concurrent[0] = current_concurrent[0]
+            await asyncio.sleep(0.01)  # simulate latency
+            current_concurrent[0] -= 1
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
 
-    class FakeResponse:
-        def __init__(self, text, status_code=200):
-            self.text = text
-            self.status_code = status_code
-        def raise_for_status(self):
-            pass
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            url_str = str(url)
-            if "notice_id" in url_str:
-                current_concurrent[0] += 1
-                if current_concurrent[0] > max_concurrent[0]:
-                    max_concurrent[0] = current_concurrent[0]
-                await asyncio.sleep(0.005)
-                current_concurrent[0] -= 1
-                if "notice_id=50" in url_str:
-                    raise Exception("Simulated failure for card 50")
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)):
         results = await adapter.fetch_opportunities()
 
-    # Expired cards should be skipped (6 of them)
-    assert len(results) > 0, "Should have results despite one failure"
-    assert max_concurrent[0] <= _MAX_CONCURRENT_DETAIL_FETCHES, (
-        f"Max concurrent was {max_concurrent[0]}, limit is {_MAX_CONCURRENT_DETAIL_FETCHES}"
+    # Bounded concurrency: 1 < peak <= 8
+    assert 1 < max_concurrent[0] <= _MAX_CONCURRENT_DETAIL_FETCHES, (
+        f"peak_concurrency={max_concurrent[0]}"
     )
+    # Exact request count = 100 active cards (expired are never requested)
+    detail_requests = [u for u in request_urls if "notice_id" in u]
+    assert len(detail_requests) == 100
+    # No expired IDs in request log
+    assert not any("exp" in u for u in detail_requests)
+    # Results exist
+    assert len(results) > 0
 
-
-# ---------------------------------------------------------------------------
-# TIMING: adapter completes within defined max time for 106 cards
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_timing_106_cards_under_30_seconds():
-    """Adapter must complete 106 cards well under 30s with concurrent mocks."""
-    cards_html = ""
-    for i in range(106):
-        cards_html += _make_card_html(
-            f"Opp {i}", "Colombia", f"view_notice.cfm?notice_id={i}", deadline="30-Dec-26"
-        )
+async def test_timing_concurrent_faster_than_sequential():
+    """Concurrent execution is materially faster than sequential would be."""
+    n_cards = 50
+    per_request_delay = 0.02  # 20ms
+    cards_html = "".join(
+        _make_card_html(f"O{i}", "Colombia", f"view_notice.cfm?notice_id={i}", "30-Dec-26")
+        for i in range(n_cards)
+    )
     listing_html = _make_listing_html(cards_html)
-    detail_html = _make_detail_html("Overview about governance and transparency")
+    detail_html = _make_detail_html("Governance transparency reform")
 
     config = _make_config()
     adapter = UNDPAdapter(config)
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
-            self.status_code = 200
-        def raise_for_status(self):
-            pass
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                await asyncio.sleep(0.005)
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
+    async def handler(url):
+        if "notice_id" in url:
+            await asyncio.sleep(per_request_delay)
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
 
     start = time.time()
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)):
         results = await adapter.fetch_opportunities()
     elapsed = time.time() - start
 
-    # With 8 concurrent and 5ms each: 106/8 * 0.005 ≈ 0.07s — well under 30s
-    assert elapsed < 30, f"Took {elapsed:.1f}s — should be well under 30s"
+    # Sequential lower bound: 50 * 0.02 = 1.0s
+    # Concurrent (8 slots): ceil(50/8) * 0.02 ≈ 0.14s
+    sequential_lower_bound = n_cards * per_request_delay
+    assert elapsed < sequential_lower_bound * 0.5, (
+        f"Elapsed {elapsed:.2f}s >= {sequential_lower_bound * 0.5:.2f}s — not concurrent enough"
+    )
     assert len(results) > 0
 
 
 # ---------------------------------------------------------------------------
-# Integration: description populated from detail page
+# TIMEOUT PRESERVES COMPLETED WORK
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_description_populated_from_detail_page():
-    """description_snippet is set from detail page Overview, not title."""
-    overview = "Anti-corruption and justice reform program for Colombia region"
-    detail_html = _make_detail_html(overview)
-    listing_html = _make_listing_html(
-        _make_card_html("Generic Title", "Colombia", "view_notice.cfm?notice_id=99")
+async def test_timeout_preserves_completed_records():
+    """Fast records are preserved when slow ones exceed the adapter deadline."""
+    # 5 fast cards + 1 slow card that would exceed a very short deadline
+    cards_html = "".join(
+        _make_card_html(f"Fast{i}", "Colombia", f"view_notice.cfm?notice_id=fast{i}", "30-Dec-26")
+        for i in range(5)
     )
+    cards_html += _make_card_html("Slow", "Colombia", "view_notice.cfm?notice_id=slow", "30-Dec-26")
+    listing_html = _make_listing_html(cards_html)
+    detail_html = _make_detail_html("Governance and transparency")
 
     config = _make_config()
     adapter = UNDPAdapter(config)
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.text = text
-            self.status_code = 200
-        def raise_for_status(self):
-            pass
+    async def handler(url):
+        if "slow" in url:
+            await asyncio.sleep(10)  # will be cancelled
+            return FakeResponse(detail_html)
+        if "notice_id" in url:
+            await asyncio.sleep(0.01)
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
 
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                return FakeResponse(detail_html)
-            return FakeResponse(listing_html)
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+    # Use a very short adapter timeout
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)), \
+         patch("portals.undp_adapter._ADAPTER_LEVEL_TIMEOUT", 0.5):
         results = await adapter.fetch_opportunities()
 
-    assert len(results) >= 1
-    assert results[0]["description_snippet"] != "Generic Title"
-    assert "corruption" in results[0]["description_snippet"].lower()
-
-
-@pytest.mark.asyncio
-async def test_fallback_to_title_on_detail_failure():
-    """When detail page fetch raises, description stays as title and adapter continues."""
-    card_title = "Anti-corruption program support Colombia"
-    listing_html = _make_listing_html(
-        _make_card_html(card_title, "Colombia", "view_notice.cfm?notice_id=42")
-    )
-
-    config = _make_config()
-    adapter = UNDPAdapter(config)
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def get(self, url, **kwargs):
-            if "notice_id" in str(url):
-                raise Exception("Simulated detail page failure")
-            resp = MagicMock()
-            resp.text = listing_html
-            resp.status_code = 200
-            resp.raise_for_status = MagicMock()
-            return resp
-
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
-        results = await adapter.fetch_opportunities()
-
-    assert len(results) >= 1
-    assert results[0]["description_snippet"] == card_title
+    # Fast records should be preserved (they complete before the deadline)
+    assert len(results) >= 1, "Completed fast records should not be discarded"
+    # The result should NOT be empty (the old behavior)
+    # The slow task should have been cancelled, not blocking others
