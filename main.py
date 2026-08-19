@@ -142,7 +142,15 @@ async def run_scraper():
                 continue
 
             total_matched += 1
-            opp["matched_keywords"] = keyword_filter.get_matched_keywords(opp)
+            # Use full overview text for keyword extraction if available (same text passes_filter saw)
+            full_overview = opp.get("_full_overview")
+            if full_overview:
+                saved_snippet = opp["description_snippet"]
+                opp["description_snippet"] = full_overview
+                opp["matched_keywords"] = keyword_filter.get_matched_keywords(opp)
+                opp["description_snippet"] = saved_snippet
+            else:
+                opp["matched_keywords"] = keyword_filter.get_matched_keywords(opp)
 
             # Map opportunity_id → devex_opportunity_id for OpportunityRecord compatibility
             opp.setdefault("devex_opportunity_id", opportunity_id)

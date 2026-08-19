@@ -218,18 +218,21 @@ class UNDPAdapter(BasePortalAdapter):
         keyword_filter = KeywordFilter(self.config)
         filtered: list[dict] = []
         for opp in active_cards:
-            # Temporarily swap description_snippet with full overview for matching
+            # Use full overview for matching if available
+            full_overview = opp.get("_full_overview")
             original_snippet = opp.get("description_snippet", "")
-            full_overview = opp.pop("_full_overview", None)
+
             if full_overview:
+                # Temporarily set full text for filter check
                 opp["description_snippet"] = full_overview
 
             if keyword_filter.passes_filter(opp):
-                # Restore truncated version for storage
+                # Keep _full_overview in the dict for downstream get_matched_keywords()
+                # Store truncated version as description_snippet for display/sheet
                 opp["description_snippet"] = full_overview[:_DESCRIPTION_DISPLAY_MAX] if full_overview else original_snippet
                 filtered.append(opp)
             else:
-                # Not matched — restore and discard
+                # Not matched — restore original and discard
                 opp["description_snippet"] = original_snippet
 
         print(f"[UNDP] Passed keyword filter: {len(filtered)}")

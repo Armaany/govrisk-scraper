@@ -165,6 +165,63 @@ async def test_keyword_after_1000_chars_still_passes():
 
     assert len(results) >= 1, "Keyword at position 1500 should still match via full-text"
     assert len(results[0]["description_snippet"]) <= _DESCRIPTION_DISPLAY_MAX
+    # Verify _full_overview is preserved for downstream get_matched_keywords
+    assert "_full_overview" in results[0], "_full_overview must be kept for main.py to use"
+    assert "corruption" in results[0]["_full_overview"]
+
+
+@pytest.mark.asyncio
+async def test_matched_keywords_populated_from_full_overview():
+    """get_matched_keywords() must find keywords beyond char 1000 using _full_overview."""
+    from engine.keyword_filter import KeywordFilter
+
+    # Build overview with keyword only after position 1500
+    filler = "generic text " * 130  # ~1690 chars
+    overview = filler + "transparency reform initiative"
+    detail_html = _make_detail_html(overview)
+    listing_html = _make_listing_html(
+        _make_card_html("Boring Title No Keywords", "Colombia", "view_notice.cfm?notice_id=7")
+    )
+
+    config = _make_config()
+    adapter = UNDPAdapter(config)
+
+    class FakeResponse:
+        def __init__(self, text):
+            self.text = text
+            self.status_code = 200
+        def raise_for_status(self):
+            pass
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def get(self, url, **kwargs):
+            if "notice_id" in str(url):
+                return FakeResponse(detail_html)
+            return FakeResponse(listing_html)
+
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeAsyncClient()):
+        results = await adapter.fetch_opportunities()
+
+    assert len(results) >= 1
+
+    # Simulate what main.py does: use _full_overview for get_matched_keywords
+    opp = results[0]
+    kf = KeywordFilter(config)
+    full_overview = opp.get("_full_overview")
+    assert full_overview is not None
+
+    saved = opp["description_snippet"]
+    opp["description_snippet"] = full_overview
+    matched = kf.get_matched_keywords(opp)
+    opp["description_snippet"] = saved
+
+    assert "transparency" in matched, (
+        f"Expected 'transparency' in matched_keywords but got: '{matched}'"
+    )
 
 
 @pytest.mark.asyncio
