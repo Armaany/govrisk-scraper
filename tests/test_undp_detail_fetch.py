@@ -21,9 +21,11 @@ from engine.keyword_filter import MATCHING_TEXT_KEY, KeywordFilter
 from portals.undp_adapter import (
     UNDPAdapter,
     _extract_overview_from_detail,
+    _parse_retry_after,
     _DESCRIPTION_DISPLAY_MAX,
     _MAX_CONCURRENT_DETAIL_FETCHES,
     _MAX_ATTEMPTS,
+    _DETAIL_ENRICHMENT_DEADLINE,
 )
 
 
@@ -274,32 +276,31 @@ async def test_404_gets_exactly_one_attempt():
 
 @pytest.mark.asyncio
 async def test_shared_client_reused():
-    """The same client instance is used for listing and all detail requests."""
+    """The AsyncClient constructor is called exactly once — proving client reuse."""
     detail_html = _make_detail_html("Governance text")
     listing_html = _make_listing_html(
         _make_card_html("Gov", "Colombia", "view_notice.cfm?notice_id=1") +
         _make_card_html("Gov2", "Colombia", "view_notice.cfm?notice_id=2")
     )
-    clients_created = [0]
-    original_init = FakeClient.__init__
 
     async def handler(url):
         if "notice_id" in url:
             return FakeResponse(detail_html)
         return FakeResponse(listing_html)
 
-    def tracking_init(self, h):
-        clients_created[0] += 1
-        original_init(self, h)
-
     config = _make_config()
     adapter = UNDPAdapter(config)
 
     fake = FakeClient(handler)
-    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=fake):
+    mock_constructor = MagicMock(return_value=fake)
+    with patch("portals.undp_adapter.httpx.AsyncClient", mock_constructor):
         await adapter.fetch_opportunities()
 
-    # All requests should go through the same FakeClient instance
+    # Constructor called exactly once — not per-record
+    assert mock_constructor.call_count == 1, (
+        f"Expected AsyncClient constructed once, got {mock_constructor.call_count} calls"
+    )
+    # All requests routed through that single instance
     assert len(fake.request_log) >= 3  # 1 listing + 2 details
 
 
@@ -420,7 +421,7 @@ async def test_timeout_preserves_completed_records():
 
     # Use a very short adapter timeout
     with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)), \
-         patch("portals.undp_adapter._ADAPTER_LEVEL_TIMEOUT", 0.5):
+         patch("portals.undp_adapter._DETAIL_ENRICHMENT_DEADLINE", 0.5):
         results = await adapter.fetch_opportunities()
 
     # Fast records should be preserved (they complete before the deadline)
@@ -617,3 +618,58 @@ async def test_orchestration_end_to_end_keyword_after_1000():
     # (In dry_run it's not written, but the strip happens in the merged dict)
     # The opp itself may still have it since main.py strips from 'merged', not 'opp'
     # This is fine — the important thing is it doesn't reach OpportunityRecord
+
+
+# ---------------------------------------------------------------------------
+# RETRY-AFTER: delay-seconds and HTTP-date formats
+# ---------------------------------------------------------------------------
+
+def test_parse_retry_after_delay_seconds():
+    """Numeric Retry-After: 30 → 30s clamped to deadline."""
+    assert _parse_retry_after("30", remaining_deadline=60) == 30
+    # Clamped to remaining deadline
+    assert _parse_retry_after("30", remaining_deadline=10) == 10
+
+
+def test_parse_retry_after_http_date():
+    """HTTP-date Retry-After parsed and clamped to deadline."""
+    from datetime import datetime, timezone, timedelta
+    future = datetime.now(timezone.utc) + timedelta(seconds=5)
+    http_date = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    result = _parse_retry_after(http_date, remaining_deadline=60)
+    # Should be approximately 5 seconds (±1s for execution time)
+    assert 3 <= result <= 7
+
+
+def test_parse_retry_after_invalid_returns_zero():
+    """Unparseable Retry-After returns 0."""
+    assert _parse_retry_after("not-a-date-or-number", remaining_deadline=60) == 0
+    assert _parse_retry_after("", remaining_deadline=60) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_after_numeric_respected():
+    """429 with Retry-After: 0.01 — adapter waits then retries successfully."""
+    detail_html = _make_detail_html("Transparency reform program")
+    listing_html = _make_listing_html(
+        _make_card_html("Title", "Colombia", "view_notice.cfm?notice_id=1")
+    )
+    attempts = [0]
+
+    async def handler(url):
+        if "notice_id" in url:
+            attempts[0] += 1
+            if attempts[0] == 1:
+                return FakeResponse("", status_code=429, headers={"Retry-After": "0.01"})
+            return FakeResponse(detail_html)
+        return FakeResponse(listing_html)
+
+    config = _make_config()
+    adapter = UNDPAdapter(config)
+
+    with patch("portals.undp_adapter.httpx.AsyncClient", return_value=FakeClient(handler)), \
+         patch("portals.undp_adapter.random.uniform", return_value=0):
+        results = await adapter.fetch_opportunities()
+
+    assert attempts[0] == 2
+    assert len(results) >= 1

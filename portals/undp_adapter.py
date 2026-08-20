@@ -2,6 +2,9 @@
 
 v3: Unified _matching_text, shared httpx client, retry/backoff for transient errors,
 bounded concurrency, explicit task management for timeout preservation.
+
+Deadline policy: _ADAPTER_LEVEL_TIMEOUT (120s) applies to detail-page enrichment only.
+The listing-page fetch has its own separate timeout (part of the shared client config).
 """
 import asyncio
 import hashlib
@@ -9,6 +12,7 @@ import logging
 import random
 import re
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -27,7 +31,7 @@ _LATAM_REGION_CLASS = "region_RLA"
 # Concurrency and timeout settings
 _MAX_CONCURRENT_DETAIL_FETCHES = 8
 _DETAIL_REQUEST_TIMEOUT = 12  # seconds per individual request attempt
-_ADAPTER_LEVEL_TIMEOUT = 120  # seconds — entire adapter must complete within this
+_DETAIL_ENRICHMENT_DEADLINE = 120  # seconds — detail enrichment phase must complete within this
 
 # Retry settings — only for transient failures
 _MAX_ATTEMPTS = 3
@@ -37,6 +41,30 @@ _PERMANENT_FAIL_STATUS_CODES = {400, 401, 403, 404}
 
 # Display/storage truncation (NOT used for keyword matching)
 _DESCRIPTION_DISPLAY_MAX = 1000
+
+
+def _parse_retry_after(value: str, remaining_deadline: float) -> float:
+    """Parse Retry-After header value (delay-seconds or HTTP-date).
+
+    Returns the number of seconds to wait, clamped to remaining_deadline.
+    Falls back to 0 if unparseable.
+    """
+    if not value:
+        return 0
+    # Try delay-seconds first
+    try:
+        delay = float(value)
+        return min(delay, remaining_deadline)
+    except ValueError:
+        pass
+    # Try HTTP-date (RFC 7231)
+    try:
+        target_dt = parsedate_to_datetime(value)
+        now = datetime.now(target_dt.tzinfo) if target_dt.tzinfo else datetime.utcnow()
+        delay = max(0, (target_dt - now).total_seconds())
+        return min(delay, remaining_deadline)
+    except (ValueError, TypeError, OverflowError):
+        return 0
 
 
 def _parse_deadline(raw: Optional[str]) -> Optional[str]:
@@ -183,7 +211,7 @@ class UNDPAdapter(BasePortalAdapter):
 
             # Bounded-concurrency detail enrichment with explicit deadline
             semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DETAIL_FETCHES)
-            deadline = asyncio.get_event_loop().time() + _ADAPTER_LEVEL_TIMEOUT
+            deadline = asyncio.get_event_loop().time() + _DETAIL_ENRICHMENT_DEADLINE
 
             async def enrich_one(opp: dict) -> bool:
                 """Enrich one opportunity. Returns True if detail fetched successfully."""
@@ -191,7 +219,9 @@ class UNDPAdapter(BasePortalAdapter):
                 if not detail_url or detail_url == BASE_URL:
                     return False
                 # Semaphore is acquired per-attempt inside _fetch_detail_with_retry
-                overview = await self._fetch_detail_with_retry(client, detail_url, semaphore)
+                overview = await self._fetch_detail_with_retry(
+                    client, detail_url, semaphore, deadline=deadline
+                )
                 if overview:
                     opp[MATCHING_TEXT_KEY] = overview
                     opp["description_snippet"] = overview[:_DESCRIPTION_DISPLAY_MAX]
@@ -243,17 +273,25 @@ class UNDPAdapter(BasePortalAdapter):
         return filtered[: self.config.max_results]
 
     async def _fetch_detail_with_retry(
-        self, client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore
+        self, client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore,
+        deadline: float = 0,
     ) -> Optional[str]:
         """Fetch a detail page with bounded retry for transient failures.
 
         The semaphore is acquired/released per individual network attempt so that
-        backoff sleeping does not hold a concurrency permit. This ensures later
-        opportunities can proceed while throttled requests are waiting.
+        backoff sleeping does not hold a concurrency permit.
+
+        Retry-After is supported in both delay-seconds and HTTP-date formats,
+        clamped to the remaining enrichment deadline.
 
         Returns the extracted Overview text or None on permanent/exhausted failure.
         """
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            remaining = max(0, deadline - asyncio.get_event_loop().time()) if deadline else 999
+            if remaining <= 0:
+                logger.warning("[undp] Deadline expired before attempt %d for %s", attempt, url)
+                return None
+
             try:
                 # Acquire semaphore only around the actual network call
                 async with semaphore:
@@ -269,14 +307,11 @@ class UNDPAdapter(BasePortalAdapter):
                 # Retryable status — release permit before sleeping
                 if resp.status_code in _RETRYABLE_STATUS_CODES:
                     if attempt < _MAX_ATTEMPTS:
-                        retry_after = resp.headers.get("Retry-After")
-                        if retry_after:
-                            try:
-                                wait = min(float(retry_after), _ADAPTER_LEVEL_TIMEOUT / 4)
-                            except ValueError:
-                                wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                        else:
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = _parse_retry_after(retry_after, remaining)
+                        if wait <= 0:
                             wait = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                            wait = min(wait, remaining)
                         await asyncio.sleep(wait)
                         continue
                     logger.warning(
@@ -291,6 +326,7 @@ class UNDPAdapter(BasePortalAdapter):
             except (httpx.ConnectError, httpx.TimeoutException) as exc:
                 if attempt < _MAX_ATTEMPTS:
                     backoff = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                    backoff = min(backoff, remaining)
                     logger.info(
                         "[undp] Transient error for %s (attempt %d/%d): %s — retrying in %.1fs",
                         url, attempt, _MAX_ATTEMPTS, exc, backoff,
