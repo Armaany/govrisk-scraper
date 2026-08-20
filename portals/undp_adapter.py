@@ -190,13 +190,13 @@ class UNDPAdapter(BasePortalAdapter):
                 detail_url = opp.get("opportunity_link", "")
                 if not detail_url or detail_url == BASE_URL:
                     return False
-                async with semaphore:
-                    overview = await self._fetch_detail_with_retry(client, detail_url)
-                    if overview:
-                        opp[MATCHING_TEXT_KEY] = overview
-                        opp["description_snippet"] = overview[:_DESCRIPTION_DISPLAY_MAX]
-                        return True
-                    return False
+                # Semaphore is acquired per-attempt inside _fetch_detail_with_retry
+                overview = await self._fetch_detail_with_retry(client, detail_url, semaphore)
+                if overview:
+                    opp[MATCHING_TEXT_KEY] = overview
+                    opp["description_snippet"] = overview[:_DESCRIPTION_DISPLAY_MAX]
+                    return True
+                return False
 
             # Create tasks and wait with timeout
             tasks = [asyncio.create_task(enrich_one(opp)) for opp in active_cards]
@@ -243,15 +243,21 @@ class UNDPAdapter(BasePortalAdapter):
         return filtered[: self.config.max_results]
 
     async def _fetch_detail_with_retry(
-        self, client: httpx.AsyncClient, url: str
+        self, client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore
     ) -> Optional[str]:
         """Fetch a detail page with bounded retry for transient failures.
 
-        Returns the extracted Overview text or None on permanent failure.
+        The semaphore is acquired/released per individual network attempt so that
+        backoff sleeping does not hold a concurrency permit. This ensures later
+        opportunities can proceed while throttled requests are waiting.
+
+        Returns the extracted Overview text or None on permanent/exhausted failure.
         """
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                resp = await client.get(url)
+                # Acquire semaphore only around the actual network call
+                async with semaphore:
+                    resp = await client.get(url)
 
                 # Permanent failure — do not retry
                 if resp.status_code in _PERMANENT_FAIL_STATUS_CODES:
@@ -260,19 +266,18 @@ class UNDPAdapter(BasePortalAdapter):
                     )
                     return None
 
-                # Retryable status
+                # Retryable status — release permit before sleeping
                 if resp.status_code in _RETRYABLE_STATUS_CODES:
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after and attempt < _MAX_ATTEMPTS:
-                        try:
-                            wait = min(float(retry_after), _ADAPTER_LEVEL_TIMEOUT / 4)
-                        except ValueError:
-                            wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                        await asyncio.sleep(wait)
-                        continue
                     if attempt < _MAX_ATTEMPTS:
-                        backoff = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
-                        await asyncio.sleep(backoff)
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait = min(float(retry_after), _ADAPTER_LEVEL_TIMEOUT / 4)
+                            except ValueError:
+                                wait = _BASE_BACKOFF * (2 ** (attempt - 1))
+                        else:
+                            wait = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                        await asyncio.sleep(wait)
                         continue
                     logger.warning(
                         "[undp] Exhausted %d attempts for %s (last status=%d)",
@@ -298,7 +303,6 @@ class UNDPAdapter(BasePortalAdapter):
                     )
                     return None
             except httpx.HTTPStatusError as exc:
-                # Unexpected status error — treat as non-retryable
                 logger.warning("[undp] HTTP error for %s: %s", url, exc)
                 return None
             except Exception as exc:
