@@ -68,21 +68,45 @@ class OpportunityRecord:
     source_portal: str = "devex"
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a flat dictionary for storage adapters such as Google Sheets."""
+        """Return the canonical, round-trippable dictionary for this record.
+
+        Every dataclass field is emitted under its INTERNAL name so that
+        ``from_dict(to_dict(record))`` faithfully reproduces the original record.
+        This is the single source of truth for serialization; storage adapters
+        are responsible for projecting these canonical keys onto their own
+        external schemas (e.g. the SheetsAdapter maps ``source_portal`` onto the
+        external ``portal_source`` column). This method emits ``source_portal``
+        only and never the external ``portal_source`` label.
+
+        Representation choices preserve round-trip fidelity:
+        - Optional string fields keep ``None`` distinct from ``""``.
+        - ``matched_keywords`` / ``risk_flags`` are emitted as lists so arbitrary
+          contents (commas, whitespace) survive intact.
+        - Enums serialize to ``.value`` (or ``""`` when unset).
+        - ``deadline`` / ``scraped_at`` serialize via ``.isoformat()``.
+        """
         return {
-           "portal_source": self.source_portal,
-        "opportunity_title": self.opportunity_title or "",
-        "funder_organisation": self.funder_organisation or "",
-        "country_region": self.country_region or "",
-        "deadline": self.deadline.isoformat() if self.deadline else "",
-        "contract_value": self.contract_value or "",
-        "opportunity_link": self.opportunity_link or "",
-        "summary": self.summary or "",
-        "relevance_score": self.relevance_score.value if self.relevance_score else "",
-        "bid_recommendation": self.bid_recommendation.value if self.bid_recommendation else "",
-        "risk_flags": ", ".join(self.risk_flags) if self.risk_flags else "",
-        "review_status": self.review_status.value if self.review_status else "pending_review",
-    }
+            "devex_opportunity_id": self.devex_opportunity_id or "",
+            "opportunity_title": self.opportunity_title or "",
+            "funder_organisation": self.funder_organisation or "",
+            "country_region": self.country_region or "",
+            "deadline": self.deadline.isoformat() if self.deadline else "",
+            "contract_value": self.contract_value,
+            "opportunity_link": self.opportunity_link or "",
+            "description_snippet": self.description_snippet or "",
+            "matched_keywords": list(self.matched_keywords),
+            "summary": self.summary,
+            "relevance_score": self.relevance_score.value if self.relevance_score else "",
+            "relevance_reason": self.relevance_reason,
+            "bid_recommendation": self.bid_recommendation.value if self.bid_recommendation else "",
+            "risk_flags": list(self.risk_flags),
+            "llm_confidence": self.llm_confidence.value if self.llm_confidence else "",
+            "review_status": self.review_status.value if self.review_status else "pending_review",
+            "llm_called": self.llm_called,
+            "anna_benchmark": self.anna_benchmark,
+            "scraped_at": self.scraped_at.isoformat(),
+            "source_portal": self.source_portal,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OpportunityRecord":

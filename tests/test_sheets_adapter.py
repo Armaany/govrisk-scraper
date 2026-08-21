@@ -1,10 +1,23 @@
-"""Property-based tests for SheetsAdapter source_portal handling.
+"""Property-based and adversarial tests for SheetsAdapter (Option A, schema v1.0).
 
 Feature: multi-portal-adapter-architecture
+
+Under the Option A schema contract the live Google Sheet keeps its frozen
+12-column ``Live_Sheet_Schema`` whose first column is the external label
+``portal_source``. The canonical model field is ``source_portal``; the
+``SheetsAdapter`` projects it onto the external ``portal_source`` column.
+
+This module covers:
+- Property 14: source_portal is written to the portal_source column (col 1).
+- Property 15: get_records_since() is unsupported (raises).
+- Startup header validation (schema v1.0): initialize-if-empty, else strict
+  validation rejecting missing/duplicate/reordered/unexpected headers, never
+  auto-repairing a populated header, validating before any write.
+- Deprecation of get_all_ids()/record_exists() (no persisted ID column).
 """
 import sys
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from hypothesis import given, settings
@@ -18,7 +31,7 @@ sys.modules.setdefault("google.oauth2", MagicMock())
 sys.modules.setdefault("google.oauth2.service_account", MagicMock())
 
 from models import OpportunityRecord  # noqa: E402
-from store.adapter_sheets import SheetsAdapter  # noqa: E402
+from store.adapter_sheets import SheetsAdapter, SheetsSchemaError  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -41,27 +54,16 @@ def _make_record(source_portal: str) -> OpportunityRecord:
 
 
 def _make_adapter() -> SheetsAdapter:
-    """Return a SheetsAdapter with all Google Sheets I/O mocked out."""
-    with patch("store.adapter_sheets.Credentials"), \
-         patch("store.adapter_sheets.gspread") as mock_gspread:
-        mock_ws = MagicMock()
-        mock_ws.row_values.return_value = SheetsAdapter.HEADERS  # headers already present
-        mock_ws.col_values.return_value = ["devex_opportunity_id"]
-        mock_gspread.authorize.return_value.open_by_key.return_value.worksheet.return_value = mock_ws
-
-        cfg = MagicMock()
-        cfg.service_account_json = "service_account.json"
-        cfg.google_sheets_id = "fake-sheet-id"
-        cfg.sheets_tab_name = "Sheet1"
-
-        adapter = SheetsAdapter.__new__(SheetsAdapter)
-        adapter.config = cfg
-        adapter.worksheet = mock_ws
-        return adapter
+    """Return a SheetsAdapter with all Google Sheets I/O mocked out (no __init__)."""
+    adapter = SheetsAdapter.__new__(SheetsAdapter)
+    adapter.config = MagicMock()
+    adapter.worksheet = MagicMock()
+    return adapter
 
 
 # ---------------------------------------------------------------------------
-# Property 14: SheetsAdapter writes source_portal at correct column position
+# Property 14: SheetsAdapter maps canonical source_portal onto the external
+# portal_source column (column 1 of the frozen Live_Sheet_Schema).
 # Validates: Requirements 9.3, 9.4
 # ---------------------------------------------------------------------------
 
@@ -75,81 +77,152 @@ SOURCE_PORTAL_VALUES = st.one_of(
 
 @given(source_portal=SOURCE_PORTAL_VALUES)
 @settings(max_examples=100)
-def test_property_14_write_record_source_portal_at_correct_column(source_portal):
-    """Property 14: SheetsAdapter writes source_portal at correct column position.
-
-    For any OpportunityRecord with any source_portal value, the row written by
-    write_record() must contain that value at the index corresponding to
-    "source_portal" in HEADERS.
+def test_property_14_write_record_maps_source_portal_to_portal_source_column(source_portal):
+    """Property 14: write_record projects canonical source_portal onto the
+    external portal_source column (column 1) of the frozen 12-column schema.
 
     **Validates: Requirements 9.3, 9.4**
     """
     adapter = _make_adapter()
     record = _make_record(source_portal)
 
-    # Capture the row passed to append_row
+    assert "source_portal" not in SheetsAdapter.HEADERS
+    assert len(SheetsAdapter.HEADERS) == 12
+
     written_rows = []
     adapter.worksheet.append_row.side_effect = lambda row, **kwargs: written_rows.append(row)
-    adapter.worksheet.col_values.return_value = ["devex_opportunity_id", "test-001"]
+    adapter.worksheet.col_values.return_value = ["portal_source", "test-001"]
 
     adapter.write_record(record)
 
     assert len(written_rows) == 1, "append_row should be called exactly once"
     written_row = written_rows[0]
+    assert len(written_row) == 12
 
-    expected_index = SheetsAdapter.HEADERS.index("source_portal")
+    expected_index = SheetsAdapter.HEADERS.index("portal_source")
+    assert expected_index == 0
     assert written_row[expected_index] == source_portal, (
-        f"Expected source_portal='{source_portal}' at index {expected_index}, "
-        f"got '{written_row[expected_index]}'"
+        f"Expected source_portal='{source_portal}' at portal_source index "
+        f"{expected_index}, got '{written_row[expected_index]}'"
     )
 
 
 # ---------------------------------------------------------------------------
-# Property 15: Store get_records_since returns "devex" default for legacy rows
+# Property 15: SheetsAdapter.get_records_since() is unsupported under the
+# Live_Sheet_Schema (no scraped_at column) and raises NotImplementedError.
 # Validates: Requirements 9.6
 # ---------------------------------------------------------------------------
 
-def _make_legacy_row(scraped_at: datetime, extra_fields: dict) -> dict:
-    """Build a row dict that lacks source_portal (simulating a legacy row)."""
-    row = {
-        "devex_opportunity_id": "legacy-001",
-        "opportunity_title": "Legacy Opportunity",
-        "scraped_at": scraped_at.isoformat(),
-    }
-    row.update(extra_fields)
-    # Explicitly ensure source_portal is absent
-    row.pop("source_portal", None)
-    return row
-
-
-EXTRA_FIELDS_STRATEGY = st.fixed_dictionaries({
-    "opportunity_title": st.text(min_size=0, max_size=50),
-    "funder_organisation": st.text(min_size=0, max_size=50),
-})
-
-
-@given(extra_fields=EXTRA_FIELDS_STRATEGY)
-@settings(max_examples=100)
-def test_property_15_get_records_since_defaults_source_portal_for_legacy_rows(extra_fields):
-    """Property 15: get_records_since returns "devex" default for legacy rows.
-
-    For any stored row that lacks a source_portal field, get_records_since()
-    must return "devex" as the source_portal value for that row.
+def test_property_15_get_records_since_unsupported_for_sheets():
+    """Property 15: get_records_since() is deprecated for the Live_Sheet_Schema
+    and raises NotImplementedError (there is no scraped_at column to filter on).
 
     **Validates: Requirements 9.6**
     """
     adapter = _make_adapter()
-    since = datetime(2020, 1, 1)
-    scraped_at = datetime(2024, 6, 1, 12, 0, 0)
+    with pytest.raises(NotImplementedError):
+        adapter.get_records_since(datetime(2020, 1, 1))
 
-    legacy_row = _make_legacy_row(scraped_at, extra_fields)
-    assert "source_portal" not in legacy_row, "Test setup error: legacy row must not have source_portal"
 
-    adapter.worksheet.get_all_records.return_value = [legacy_row]
+# ---------------------------------------------------------------------------
+# Startup header validation (schema v1.0, Option A)
+# Validates: Requirements 9.8
+# ---------------------------------------------------------------------------
 
-    results = adapter.get_records_since(since)
+def test_valid_header_passes_validation():
+    """The exact canonical 12-column header validates without raising."""
+    adapter = _make_adapter()
+    adapter._validate_headers(list(SheetsAdapter.HEADERS))  # must not raise
 
-    assert len(results) == 1, "Expected exactly one result row"
-    assert results[0]["source_portal"] == "devex", (
-        f"Expected source_portal='devex' for legacy row, got '{results[0].get('source_portal')}'"
-    )
+
+def test_empty_sheet_initializes_canonical_header():
+    """An empty sheet is initialized by writing the canonical 12-column header."""
+    adapter = _make_adapter()
+    adapter.worksheet.row_values.return_value = []  # empty row 1
+    appended = []
+    adapter.worksheet.append_row.side_effect = lambda row, **kwargs: appended.append(row)
+
+    adapter._ensure_headers()
+
+    assert appended == [SheetsAdapter.HEADERS]
+
+
+def test_missing_required_header_rejected():
+    """A header row missing a required column is rejected."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS)
+    bad.pop()  # drop 'review_status'
+    with pytest.raises(SheetsSchemaError):
+        adapter._validate_headers(bad)
+
+
+def test_duplicate_exact_header_rejected():
+    """A header row with an exact duplicate column is rejected."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS)
+    bad[1] = "portal_source"  # duplicate of column 0
+    with pytest.raises(SheetsSchemaError):
+        adapter._validate_headers(bad)
+
+
+def test_duplicate_after_trim_and_case_rejected():
+    """Duplicates distinguishable only by whitespace/case are rejected."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS)
+    bad[1] = "  PORTAL_SOURCE  "  # normalizes to 'portal_source' -> duplicate
+    with pytest.raises(SheetsSchemaError):
+        adapter._validate_headers(bad)
+
+
+def test_reordered_header_rejected():
+    """A reordered header (same set, different order) is rejected under v1.0."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS)
+    bad[0], bad[1] = bad[1], bad[0]  # swap first two columns
+    with pytest.raises(SheetsSchemaError):
+        adapter._validate_headers(bad)
+
+
+def test_unexpected_extra_header_rejected():
+    """An unexpected extra column is rejected."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS) + ["extra_column"]
+    with pytest.raises(SheetsSchemaError):
+        adapter._validate_headers(bad)
+
+
+def test_validation_runs_before_any_write_on_populated_bad_header():
+    """When row 1 is populated but invalid, _ensure_headers raises and never
+    attempts to write/repair the header."""
+    adapter = _make_adapter()
+    bad = list(SheetsAdapter.HEADERS)
+    bad[0], bad[1] = bad[1], bad[0]  # reordered -> invalid
+    adapter.worksheet.row_values.return_value = bad
+
+    with pytest.raises(SheetsSchemaError):
+        adapter._ensure_headers()
+
+    adapter.worksheet.append_row.assert_not_called()  # no auto-repair / write
+
+
+# ---------------------------------------------------------------------------
+# Deprecated ID-based methods (no persisted opportunity-ID column)
+# Validates: Requirements 9.9
+# ---------------------------------------------------------------------------
+
+def test_get_all_ids_raises_before_worksheet_calls():
+    """get_all_ids() raises NotImplementedError without touching the worksheet."""
+    adapter = _make_adapter()
+    with pytest.raises(NotImplementedError):
+        adapter.get_all_ids()
+    adapter.worksheet.col_values.assert_not_called()
+    adapter.worksheet.get_all_values.assert_not_called()
+
+
+def test_record_exists_raises_before_worksheet_calls():
+    """record_exists() raises NotImplementedError without touching the worksheet."""
+    adapter = _make_adapter()
+    with pytest.raises(NotImplementedError):
+        adapter.record_exists("devex-123")
+    adapter.worksheet.col_values.assert_not_called()
+    adapter.worksheet.get_all_values.assert_not_called()

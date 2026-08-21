@@ -303,7 +303,7 @@ def test_property_3_deduplication_eliminates_repeated_opportunity_ids(
     ]
 
     all_opps = base_opps + duplicates
-    deduplicated, skipped = deduplicate_opportunities(all_opps, existing_ids=set())
+    deduplicated, skipped = deduplicate_opportunities(all_opps, existing_links=set())
 
     # No two entries share the same opportunity_id
     seen = set()
@@ -356,7 +356,7 @@ def test_property_4_deduplication_eliminates_repeated_opportunity_links(
     ]
 
     all_opps = base_opps + duplicates
-    deduplicated, skipped = deduplicate_opportunities(all_opps, existing_ids=set())
+    deduplicated, skipped = deduplicate_opportunities(all_opps, existing_links=set())
 
     # No two entries share the same opportunity_link
     seen_links = set()
@@ -370,25 +370,28 @@ def test_property_4_deduplication_eliminates_repeated_opportunity_links(
 
 
 # ---------------------------------------------------------------------------
-# Additional: deduplication against existing_ids from store
+# Additional: cross-run deduplication against existing_links from store
+# (Option A: cross-run dedup keys on opportunity_link, not opportunity_id)
+# Validates: Requirements 6.8, 10.5
 # ---------------------------------------------------------------------------
 
 @given(
-    ids=st.lists(opp_id_strategy, min_size=1, max_size=10, unique=True),
+    links=st.lists(opp_link_strategy, min_size=1, max_size=10, unique=True),
 )
 @settings(max_examples=50)
-def test_deduplication_skips_ids_already_in_store(ids):
-    """Opportunities whose IDs are already in the store are skipped."""
-    existing_ids = set(ids)
+def test_deduplication_skips_links_already_in_store(links):
+    """Opportunities whose links are already persisted (seeded from
+    store.get_all_links()) are skipped as cross-run duplicates."""
+    existing_links = set(links)
     opps = [
         make_opp(
-            opportunity_id=oid,
-            opportunity_link=f"https://link-{i}.example.com",
+            opportunity_id=f"id-{i}",
+            opportunity_link=link,
         )
-        for i, oid in enumerate(ids)
+        for i, link in enumerate(links)
     ]
 
-    deduplicated, skipped = deduplicate_opportunities(opps, existing_ids=existing_ids)
+    deduplicated, skipped = deduplicate_opportunities(opps, existing_links=existing_links)
 
     assert len(deduplicated) == 0
-    assert skipped == len(ids)
+    assert skipped == len(links)

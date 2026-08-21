@@ -61,7 +61,8 @@ flowchart TD
 2. Orchestrator builds adapter registry — only enabled adapters are instantiated
 3. Each adapter's `fetch_opportunities()` returns `list[Opportunity_Dict]`
 4. All results are merged into a single unified list
-5. Deduplication removes repeated `opportunity_id` values (and `opportunity_link` as fallback)
+5. Deduplication: cross-run by `opportunity_link` (seeded from `store.get_all_links()`), plus
+   within-run skipping of repeated `opportunity_id` and `opportunity_link`
 6. `KeywordFilter` applies sector + geography checks
 7. `LLMInterpreter` enriches matched opportunities via Claude
 8. Store adapter writes `OpportunityRecord` (including `source_portal`) to Sheets or Airtable
@@ -85,10 +86,10 @@ flowchart TD
 | Path | Change |
 |---|---|
 | `config.py` | Add `devex_enabled`, `samgov_api_key`, `samgov_enabled`, `perplexity_api_key`, `perplexity_enabled` fields + validation |
-| `models.py` | Add `source_portal: str` field to `OpportunityRecord`; update `to_dict()` and `from_dict()` |
-| `main.py` | Replace single-portal pipeline with adapter registry loop |
-| `store/adapter_sheets.py` | Add `"source_portal"` to `HEADERS`; update `write_record()` and `get_records_since()` |
-| `store/adapter_airtable.py` | Update `write_record()` and `get_records_since()` to handle `source_portal` |
+| `models.py` | Add `source_portal: str` field to `OpportunityRecord`; make `to_dict()` a canonical round-trippable serializer (all internal field names, no `portal_source`); update `from_dict()` |
+| `main.py` | Replace single-portal pipeline with adapter registry loop; seed cross-run dedup from `store.get_all_links()` keyed on `opportunity_link` |
+| `store/adapter_sheets.py` | Keep the existing 12-column `HEADERS` (Live_Sheet_Schema) unchanged; update `write_record()` to project the canonical dict onto the 12 external columns (`source_portal` → `portal_source` at column 1); add `get_all_links()`; deprecate `get_records_since()` |
+| `store/adapter_airtable.py` | `write_record()` passes canonical `to_dict()` (including `source_portal`) through; update `get_records_since()` default handling |
 
 ### Unchanged files
 
@@ -372,7 +373,17 @@ readable, collision-resistant for the expected volume.
 
 ### OpportunityRecord changes (`models.py`)
 
-Add `source_portal` field with backward-compatible default:
+Add the `source_portal` field with a backward-compatible default and make `to_dict()` the
+**canonical, round-trippable serializer**.
+
+> **Amendment (Option A).** This replaces the current broken `to_dict()`, which emitted the
+> external column name `"portal_source"` and dropped most dataclass fields
+> (`devex_opportunity_id`, `description_snippet`, `matched_keywords`, `relevance_reason`,
+> `llm_confidence`, `llm_called`, `anna_benchmark`, `scraped_at`). The canonical `to_dict()`
+> emits **all** dataclass fields under their **internal** names and MUST NOT emit both
+> `portal_source` and `source_portal` — it emits only the internal `source_portal`. Mapping the
+> canonical `source_portal` onto the external `portal_source` column is the responsibility of the
+> `SheetsAdapter` presentation layer (see Store Adapter Changes), not of the model.
 
 ```python
 @dataclass
@@ -381,9 +392,30 @@ class OpportunityRecord:
     source_portal: str = "devex"   # NEW — defaults to "devex" for legacy records
 
     def to_dict(self) -> dict[str, Any]:
+        """Canonical, round-trippable serialization: every dataclass field under its
+        INTERNAL name. Never emits the external ``portal_source`` label, and never emits
+        both ``portal_source`` and ``source_portal``."""
         return {
-            # ... existing keys unchanged ...
-            "source_portal": self.source_portal,   # NEW
+            "devex_opportunity_id": self.devex_opportunity_id,
+            "opportunity_title": self.opportunity_title,
+            "funder_organisation": self.funder_organisation,
+            "country_region": self.country_region,
+            "deadline": self.deadline.isoformat() if self.deadline else None,
+            "contract_value": self.contract_value,
+            "opportunity_link": self.opportunity_link,
+            "description_snippet": self.description_snippet,
+            "matched_keywords": self.matched_keywords,
+            "summary": self.summary,
+            "relevance_score": self.relevance_score.value if self.relevance_score else None,
+            "relevance_reason": self.relevance_reason,
+            "bid_recommendation": self.bid_recommendation.value if self.bid_recommendation else None,
+            "risk_flags": self.risk_flags,
+            "llm_confidence": self.llm_confidence.value if self.llm_confidence else None,
+            "review_status": self.review_status.value if self.review_status else "pending_review",
+            "llm_called": self.llm_called,
+            "anna_benchmark": self.anna_benchmark,
+            "scraped_at": self.scraped_at.isoformat() if self.scraped_at else None,
+            "source_portal": self.source_portal,   # INTERNAL name only
         }
 
     @classmethod
@@ -393,6 +425,10 @@ class OpportunityRecord:
             source_portal=str(data.get("source_portal", "devex")),   # NEW
         )
 ```
+
+**Round-trip guarantee:** `from_dict(to_dict(record))` reproduces every field, including an
+arbitrary `source_portal` value. Because `to_dict()` uses only internal names, its output is a
+valid input to `from_dict()` with no key translation.
 
 The `devex_opportunity_id` field is retained for backward compatibility with existing Sheets/
 Airtable rows. New records from non-Devex adapters will have `devex_opportunity_id` set to the
@@ -448,7 +484,10 @@ async def run_scraper():
         adapters.append(PerplexityAdapter(config))
 
     store = SheetsAdapter(config) if config.store_type == "sheets" else AirtableAdapter(config)
-    existing_ids: set[str] = set(store.get_all_ids())
+    # Cross-run dedup is keyed on opportunity_link (Req 6.8, 10.5). Seed from the persisted
+    # link column via get_all_links() — NOT get_all_ids(), which under the Live_Sheet_Schema
+    # reads column 1 (portal_source, i.e. portal names) and cannot identify prior opportunities.
+    existing_links: set[str] = set(store.get_all_links())
     keyword_filter = KeywordFilter(config)
     interpreter = LLMInterpreter(config)
 
@@ -465,20 +504,25 @@ async def run_scraper():
             audit.log_error(str(exc))
             notifier.send_error_alert(str(exc), component=adapter.portal_name)
 
-    # Deduplication across all adapters
+    # Deduplication across all adapters.
+    #  - Cross-run dedup: keyed on opportunity_link, seeded from store.get_all_links() (Req 10.5).
+    #  - Within-run dedup: skips repeated opportunity_id AND repeated opportunity_link (Req 10.4).
     seen_ids: set[str] = set()
-    seen_links: set[str] = set()
+    seen_links: set[str] = set(existing_links)   # seed persisted links for cross-run dedup
     deduplicated: list[dict] = []
     for opp in all_opportunities:
         opp_id = opp.get("opportunity_id", "")
         opp_link = opp.get("opportunity_link", "")
-        if opp_id in existing_ids or opp_id in seen_ids:
-            duplicates_skipped += 1
-            continue
+        # Cross-run + within-run link dedup (primary key under the Live_Sheet_Schema)
         if opp_link and opp_link in seen_links:
             duplicates_skipped += 1
             continue
-        seen_ids.add(opp_id)
+        # Within-run opportunity_id dedup
+        if opp_id and opp_id in seen_ids:
+            duplicates_skipped += 1
+            continue
+        if opp_id:
+            seen_ids.add(opp_id)
         if opp_link:
             seen_links.add(opp_link)
         deduplicated.append(opp)
@@ -491,9 +535,36 @@ async def run_scraper():
 
 **Key design decisions:**
 - Adapter errors are caught at the loop level — one failing adapter never blocks others
-- Deduplication uses `opportunity_id` first, then `opportunity_link` as fallback
+- Cross-run deduplication is keyed on `opportunity_link`, seeded from `store.get_all_links()`
+  (the persisted link column). The prior `get_all_ids()` seeding is removed because, under the
+  Live_Sheet_Schema, column 1 holds `portal_source` (portal names), not opportunity identifiers.
+- Within a run, both a repeated `opportunity_id` and a repeated `opportunity_link` are skipped
 - `source_portal` is carried through `Opportunity_Dict` → `OpportunityRecord` → store write
 - The filter/LLM/store pipeline code is identical to the current implementation
+
+## Schema Contract (Option A)
+
+This feature adopts **Option A**: the live Google Sheet is treated as a fixed, authoritative
+schema that is **not migrated**. The contract that governs serialization and persistence:
+
+- **Canonical internal vs. external names.** The in-memory data model uses the canonical field
+  name **`source_portal`**. The Google Sheet exposes the same datum under the external column
+  label **`portal_source`** (column 1). `OpportunityRecord.to_dict()` is canonical and emits only
+  `source_portal`; the `SheetsAdapter` presentation layer maps `source_portal → portal_source`
+  when writing. The two names are the same logical value in different representations.
+- **12-column Sheet is frozen.** `SheetsAdapter.HEADERS` remains the existing 12 columns
+  (`portal_source`, `opportunity_title`, `funder_organisation`, `country_region`, `deadline`,
+  `contract_value`, `opportunity_link`, `summary`, `relevance_score`, `bid_recommendation`,
+  `risk_flags`, `review_status`). No `source_portal`, `devex_opportunity_id`, or `scraped_at`
+  column is added, and the live Sheet is not rewritten.
+- **Canonical `to_dict()` is round-trippable.** It emits every dataclass field under its internal
+  name so that `from_dict(to_dict(record))` reproduces the record. Fields with no external column
+  are simply not projected by `SheetsAdapter.write_record()`.
+- **Link-based cross-run dedup.** Cross-run deduplication is keyed on `opportunity_link`, seeded
+  from `SheetsAdapter.get_all_links()` (column 7), replacing the old `get_all_ids()`-on-column-1
+  approach.
+- **`get_records_since()` deprecated.** With no `scraped_at` column in the Live_Sheet_Schema,
+  `SheetsAdapter.get_records_since()` is unsupported and raises `NotImplementedError` by contract (matching the implementation).
 
 ---
 
@@ -501,36 +572,152 @@ async def run_scraper():
 
 ### SheetsAdapter (`store/adapter_sheets.py`)
 
+Under Option A the live Google Sheet uses a **fixed, authoritative 12-column schema**
+(`Live_Sheet_Schema`) that predates this feature and is **not migrated**. `HEADERS` therefore
+stays **exactly as it is** — `source_portal` is **not** appended:
+
 ```python
+# UNCHANGED — the frozen 12-column Live_Sheet_Schema
 HEADERS = [
-    "devex_opportunity_id",
-    "opportunity_title",
-    # ... existing headers ...
-    "scraped_at",
-    "source_portal",   # NEW — appended at end for backward compatibility
+    "portal_source",       # col 1  — external label for canonical source_portal
+    "opportunity_title",   # col 2
+    "funder_organisation", # col 3
+    "country_region",      # col 4
+    "deadline",            # col 5
+    "contract_value",      # col 6
+    "opportunity_link",    # col 7  — persisted link, used for cross-run dedup
+    "summary",             # col 8
+    "relevance_score",     # col 9
+    "bid_recommendation",  # col 10
+    "risk_flags",          # col 11
+    "review_status",       # col 12
 ]
 ```
 
-`get_records_since()` returns `source_portal` from the row dict, or `"devex"` if absent:
+There is **no** `devex_opportunity_id` column and **no** `scraped_at` column in the live sheet.
+
+#### `write_record()` — presentation mapping (canonical → 12 external columns)
+
+`to_dict()` now returns the **canonical** dict keyed by internal field names. Because the
+external sheet uses `portal_source` (not the internal `source_portal`) and exposes only 12 of the
+canonical fields, `write_record()` performs an **explicit ordered projection** from canonical
+keys onto the 12 external columns. In particular, canonical `source_portal` is written into the
+external `portal_source` column (column 1); the other 11 columns are written from their canonical
+counterparts. Writes stay positionally aligned with the live header row.
 
 ```python
-row.setdefault("source_portal", "devex")
+def write_record(self, record: OpportunityRecord) -> str:
+    payload = record.to_dict()  # canonical, internal names
+
+    # Ordered projection: external HEADERS column -> canonical payload key.
+    # Only the source_portal <-> portal_source name differs; the rest map 1:1.
+    CANONICAL_KEY_FOR_COLUMN = {
+        "portal_source":       "source_portal",   # external label <- canonical field
+        "opportunity_title":   "opportunity_title",
+        "funder_organisation": "funder_organisation",
+        "country_region":      "country_region",
+        "deadline":            "deadline",
+        "contract_value":      "contract_value",
+        "opportunity_link":    "opportunity_link",
+        "summary":             "summary",
+        "relevance_score":     "relevance_score",
+        "bid_recommendation":  "bid_recommendation",
+        "risk_flags":          "risk_flags",
+        "review_status":       "review_status",
+    }
+    row = [payload.get(CANONICAL_KEY_FOR_COLUMN[header], "") for header in self.HEADERS]
+    self.worksheet.append_row(row, value_input_option="RAW")
+    ...
 ```
+
+The canonical fields that have no column in the Live_Sheet_Schema (`devex_opportunity_id`,
+`description_snippet`, `matched_keywords`, `relevance_reason`, `llm_confidence`, `llm_called`,
+`anna_benchmark`, `scraped_at`) are simply not projected — they remain available in memory and in
+`to_dict()` for round-tripping, but are not written to the sheet.
+
+#### Deduplication: `get_all_links()` replaces `get_all_ids()`-on-column-1
+
+The former `get_all_ids()` read **column 1**, which under the Live_Sheet_Schema is
+`portal_source` (portal names such as `"devex"`), so it could not identify previously persisted
+opportunities; it is now deprecated and raises `NotImplementedError`. Add a `get_all_links()` method that reads the **`opportunity_link` column
+(column 7)** and returns the set of persisted links. The orchestrator seeds its cross-run dedup
+set from these links (Req 6.8) and dedups across runs by `opportunity_link` (Req 10.5).
+
+```python
+def get_all_links(self) -> set[str]:
+    """Return the set of persisted opportunity_link values (column 7, excluding header)."""
+    try:
+        link_column = self.worksheet.col_values(7)  # opportunity_link
+    except Exception:
+        return set()
+    if len(link_column) <= 1:
+        return set()
+    return {value.strip() for value in link_column[1:] if value.strip()}
+```
+
+#### `get_records_since()` — unsupported/deprecated under the 12-column schema
+
+The Live_Sheet_Schema has **no `scraped_at` column**, so time-based retrieval cannot be
+supported. `get_records_since()` is deprecated and, matching the selected implementation,
+raises `NotImplementedError` (Req 9.6):
+
+```python
+def get_records_since(self, since: datetime) -> list:
+    """Unsupported under the Live_Sheet_Schema: there is no scraped_at column.
+    Raises NotImplementedError by contract (Req 9.6); use get_all_links() for
+    cross-run deduplication."""
+    raise NotImplementedError(
+        "get_records_since() is not supported under the Live_Sheet_Schema "
+        "(no 'scraped_at' column). Use get_all_links() for cross-run dedup."
+    )
+```
+
+#### Startup header validation (schema v1.0)
+
+`_ensure_headers()` enforces the frozen schema on initialization, before any
+read or write:
+
+- If the sheet is empty, it writes the canonical 12-column header.
+- If row 1 is populated, `_validate_headers()` checks it against `HEADERS` and
+  raises `SheetsSchemaError` on any missing, duplicate (including duplicates
+  that differ only by surrounding whitespace or letter case), reordered, or
+  unexpected header. Because header-order-independent writing is deferred to
+  Phase B, reordered/unexpected headers are rejected under v1.0 to avoid
+  positional corruption. A populated header is never rewritten or auto-repaired.
+
+#### Deprecated ID-based lookups
+
+`get_all_ids()` and `record_exists()` raise `NotImplementedError`: the frozen
+12-column schema has no persisted opportunity-ID column (column 1 is
+`portal_source`). Cross-run deduplication uses `get_all_links()` instead. The
+Airtable equivalents remain functional because Airtable persists
+`devex_opportunity_id`.
 
 ### AirtableAdapter (`store/adapter_airtable.py`)
 
-`write_record()` already calls `record.to_dict()` and passes the full payload — no structural
-change needed beyond `to_dict()` including `source_portal`.
+`write_record()` already calls `record.to_dict()` and sends the full payload, so the canonical
+`source_portal` (and all other canonical fields such as `devex_opportunity_id`) now flow through
+to Airtable automatically — no structural change is required.
 
-`get_records_since()` adds the same default:
+> **Design note / caveat.** Because `write_record()` sends the canonical payload verbatim,
+> Airtable writes will only succeed if the target table schema **already contains fields matching
+> the canonical keys** — in particular `source_portal` and `devex_opportunity_id`. Airtable
+> rejects writes to unknown field names. Ensuring these columns exist in the Airtable base is an
+> operational prerequisite, not a code change in this feature. (Unlike the Google Sheet, Airtable
+> is not constrained to the frozen 12-column Live_Sheet_Schema.)
+
+For Airtable, `get_records_since()` keeps the legacy default (Req 9.7): records that predate the
+`source_portal` field default to `"devex"`:
 
 ```python
 fields.setdefault("source_portal", "devex")
 ```
 
-`get_all_ids()` currently reads `devex_opportunity_id`. After the refactor, new records from
-non-Devex adapters store their portal-prefixed ID in `devex_opportunity_id` (e.g.
-`samgov-ABC123`). This preserves the existing deduplication logic without schema changes.
+**Deduplication under Option A (both stores).** Cross-run deduplication is keyed on
+`opportunity_link`, not on any stored ID column. For `SheetsAdapter` the orchestrator seeds from
+`get_all_links()` (column 7 of the Live_Sheet_Schema); the old `get_all_ids()`-on-column-1 path
+is not used, because column 1 holds `portal_source` (portal names) under the frozen schema. The
+Sheet is **not** migrated and no `devex_opportunity_id` or `scraped_at` column is added.
 
 ---
 
@@ -548,9 +735,11 @@ non-Devex adapters store their portal-prefixed ID in `devex_opportunity_id` (e.g
 - Perplexity: no stable ID exists in free-text responses; deterministic hash of the URL
   provides stable, reproducible IDs across runs
 
-The orchestrator uses `opportunity_id` as the primary deduplication key. `opportunity_link` is
-the secondary fallback for cases where two adapters surface the same opportunity with different
-IDs.
+Deduplication under Option A: **cross-run** dedup is keyed on `opportunity_link` (seeded from
+`store.get_all_links()`), because the Live_Sheet_Schema persists no `opportunity_id` column
+(Req 10.5). **Within a single run**, the orchestrator additionally skips a repeated
+`opportunity_id` as well as a repeated `opportunity_link` (Req 10.4), so two adapters surfacing
+the same opportunity are collapsed by either key.
 
 ---
 
@@ -623,11 +812,13 @@ required keys: `opportunity_id`, `opportunity_title`, `funder_organisation`, `co
 
 ---
 
-### Property 2: source_portal identity preservation
+### Property 2: Canonical to_dict round-trips every field (incl. arbitrary source_portal)
 
-*For any* `Opportunity_Dict` with any `source_portal` value, constructing an `OpportunityRecord`
-via `from_dict()` and then calling `to_dict()` must return a dict whose `source_portal` key
-equals the original value.
+*For any* `OpportunityRecord` built from any valid `Opportunity_Dict` (with any `source_portal`
+value), `from_dict(to_dict(record))` must reproduce every field equal to the original, and
+`to_dict()` must emit `source_portal` under its internal name while never emitting the external
+label `portal_source` (i.e. the output must not contain both `portal_source` and `source_portal`,
+and must not contain `portal_source` at all).
 
 **Validates: Requirements 6.6, 9.1, 9.2**
 
@@ -738,22 +929,28 @@ produce the same `opportunity_id`, and that ID must match the pattern `perplexit
 
 ---
 
-### Property 14: SheetsAdapter writes source_portal at correct column position
+### Property 14: SheetsAdapter maps source_portal onto the portal_source column (col 1)
 
 *For any* `OpportunityRecord` with any `source_portal` value, the row written by
-`SheetsAdapter.write_record()` must contain that `source_portal` value at the index
-corresponding to `"source_portal"` in `HEADERS`.
+`SheetsAdapter.write_record()` must be exactly 12 columns wide (the unchanged Live_Sheet_Schema)
+and must contain that `source_portal` value at the index of `"portal_source"` in `HEADERS`
+(column 1), with each remaining column populated from its canonical counterpart. `HEADERS` must
+remain the frozen 12-column schema (no `source_portal` column appended).
 
 **Validates: Requirements 9.3, 9.4**
 
 ---
 
-### Property 15: Store get_records_since returns "devex" default for legacy rows
+### Property 15: get_all_links seeds link-based cross-run dedup; get_records_since is deprecated for Sheets
 
-*For any* stored row that lacks a `source_portal` field, `get_records_since()` must return
-`"devex"` as the `source_portal` value for that row.
+*For any* set of rows persisted under the Live_Sheet_Schema, `SheetsAdapter.get_all_links()` must
+return exactly the set of non-empty values in the `opportunity_link` column (column 7, excluding
+the header), and seeding the orchestrator's cross-run dedup from that set must cause any incoming
+`Opportunity_Dict` whose `opportunity_link` is already persisted to be skipped. Under the
+Live_Sheet_Schema, `SheetsAdapter.get_records_since()` must be unsupported — raising `NotImplementedError` by contract (matching the implementation). For `AirtableAdapter`, any stored record lacking a
+`source_portal` field must still default to `"devex"`.
 
-**Validates: Requirements 9.6**
+**Validates: Requirements 6.8, 9.6, 9.7, 10.5**
 
 ---
 
@@ -765,9 +962,27 @@ that does not match any value in `Config.target_countries`, `_is_latam_relevant(
 least one target country. The final list returned by `fetch_opportunities()` must contain no
 item for which `_is_latam_relevant()` returns `False`.
 
-**Validates: Requirements 3.4 (country_region field), 3.3 (LATAM focus)**
+**Validates: Requirements 3.4, 3.3**
 
 ---
+
+### Property 17: SheetsAdapter rejects incompatible headers on init
+
+*For any* populated header row that is not exactly the canonical 12-column
+`HEADERS` (missing, duplicate incl. whitespace/case-only, reordered, or
+unexpected), `SheetsAdapter._ensure_headers()` must raise `SheetsSchemaError`
+before any write, and must never rewrite a populated header. An empty sheet is
+initialized with the canonical header.
+
+**Validates: Requirements 9.8**
+
+### Property 18: Deprecated SheetsAdapter ID lookups raise
+
+`SheetsAdapter.get_all_ids()` and `SheetsAdapter.record_exists()` raise
+`NotImplementedError` before performing any worksheet call, directing callers
+to `get_all_links()` for cross-run deduplication.
+
+**Validates: Requirements 9.9**
 
 ## Testing Strategy
 
@@ -779,20 +994,22 @@ iterations. Tag format: `# Feature: multi-portal-adapter-architecture, Property 
 ### Unit tests (example-based)
 
 Focus on:
-- `BasePortalAdapter` ABC enforcement (Properties 1.1–1.4 from requirements)
+- `BasePortalAdapter` ABC enforcement (Requirement 1.3)
 - `DevexAdapter.portal_name == "devex"`, `SAMGovAdapter.portal_name == "samgov"`,
   `PerplexityAdapter.portal_name == "perplexity"`
 - `samgov_enabled=False` / `perplexity_enabled=False` guard returns `[]` without HTTP calls
-- `AuthenticationError` path in `DevexAdapter` — assert `[]` returned, audit + notifier called
-- `DevexAdapter` closes Playwright resources even when exception is raised mid-run
+- `AuthenticationError` path in `DevexAdapter`: assert `[]` returned, audit + notifier called
+- `DevexAdapter` closes Playwright resources even when an exception is raised mid-run
 - `OpportunityRecord` default `source_portal == "devex"`
+- `SheetsAdapter` startup header validation: empty-sheet initialization, and rejection of missing / duplicate (incl. whitespace/case) / reordered / unexpected headers (Requirement 9.8)
+- `SheetsAdapter.get_all_ids()` and `record_exists()` raise `NotImplementedError` before any worksheet call (Requirement 9.9)
 
 ### Property tests (Hypothesis)
 
 | Test | Property | Strategy |
 |---|---|---|
 | `test_adapter_result_fields_complete` | Property 1 | `st.lists(st.fixed_dictionaries(...))` per adapter with mocked HTTP |
-| `test_source_portal_round_trip` | Property 2 | `st.text(min_size=1)` for source_portal |
+| `test_canonical_to_dict_round_trip` | Property 2 | `st.fixed_dictionaries(...)` over all fields + `st.text(min_size=1)` for source_portal; assert `from_dict(to_dict(r))` equals `r` and `"portal_source"` absent |
 | `test_dedup_by_opportunity_id` | Property 3 | `st.lists(...)` with injected duplicates |
 | `test_dedup_by_opportunity_link` | Property 4 | `st.lists(...)` with injected duplicate links |
 | `test_adapter_registry_matches_flags` | Property 5 | `st.booleans()` × 3 for enabled flags |
@@ -804,8 +1021,8 @@ Focus on:
 | `test_devex_id_format` | Property 11 | `st.integers(min_value=1)` for numeric project IDs |
 | `test_samgov_id_format` | Property 12 | `st.text(min_size=1)` for noticeId |
 | `test_perplexity_id_deterministic` | Property 13 | `st.text()` for opportunity_link URLs |
-| `test_sheets_source_portal_column` | Property 14 | `st.text(min_size=1)` for source_portal |
-| `test_store_legacy_source_portal_default` | Property 15 | Rows with/without source_portal field |
+| `test_sheets_maps_source_portal_to_portal_source_col1` | Property 14 | `st.text(min_size=1)` for source_portal; assert 12-wide row, value at `portal_source` (col 1) |
+| `test_get_all_links_and_get_records_since_deprecated` | Property 15 | Sheet rows with varied `opportunity_link` (col 7) → `get_all_links()` set; assert `get_records_since()` raises `NotImplementedError`; Airtable rows with/without `source_portal` default to `"devex"` |
 | `test_samgov_latam_post_filter` | Property 16 | `st.lists(st.fixed_dictionaries(...))` with mixed target/non-target countries |
 
 ### Integration tests
@@ -814,6 +1031,7 @@ Focus on:
   `source_portal` for each processed opportunity
 - `SheetsAdapter` and `AirtableAdapter` write/read round-trip with `source_portal` column
   (against test spreadsheet / Airtable sandbox)
+  that a full orchestrator dry-run produces stored records with the transient fields stripped
 
 ### Regression tests
 
