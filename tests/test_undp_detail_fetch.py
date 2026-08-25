@@ -474,15 +474,22 @@ async def test_timeout_preserves_completed_records():
         "Slow task did not observe CancelledError — cancellation not propagated"
     )
 
-    # 3. Warning logged with counts
-    warning_calls = [c for c in mock_logger.warning.call_args_list]
-    deadline_warnings = [
-        c for c in warning_calls
-        if "deadline" in str(c).lower() or "incomplete" in str(c).lower()
+    # 3. Deadline warning logged with EXACT counts. Identify the specific
+    #    formatted warning call by its format string, then inspect its
+    #    positional args (total, completed, fallback, cancelled) directly.
+    deadline_calls = [
+        c for c in mock_logger.warning.call_args_list
+        if c.args and "Adapter deadline reached" in str(c.args[0])
     ]
-    assert len(deadline_warnings) >= 1, (
-        f"Expected a deadline warning, got warnings: {[str(c)[:80] for c in warning_calls]}"
+    assert len(deadline_calls) == 1, (
+        f"Expected exactly one deadline warning, got: "
+        f"{[str(c)[:80] for c in mock_logger.warning.call_args_list]}"
     )
+    total, completed, fallback, cancelled = deadline_calls[0].args[1:5]
+    assert total == 6, f"total: expected 6, got {total}"
+    assert completed == 5, f"completed: expected 5, got {completed}"
+    assert fallback == 0, f"fallback: expected 0, got {fallback}"
+    assert cancelled == 1, f"cancelled: expected 1, got {cancelled}"
 
     # 4. Results NOT silently empty
     assert len(results) >= 1, "Completed records should not be discarded"
@@ -655,10 +662,8 @@ async def test_orchestration_end_to_end_keyword_after_1000():
     record = written_records[0]
     record_dict = record.to_dict()
 
-    # matched_keywords contains "corruption"
-    assert "corruption" in record_dict.get("matched_keywords", "").lower() or \
-           "corruption" in (record.matched_keywords if hasattr(record, 'matched_keywords') else []), \
-        f"Expected 'corruption' in matched_keywords, got: {record_dict.get('matched_keywords')}"
+    # matched_keywords contains "corruption" (assert directly on the record field)
+    assert "corruption" in record.matched_keywords
 
     # description_snippet <= 1000 chars (it's stored as description_snippet in the record)
     desc_in_dict = record_dict.get("description_snippet") or record_dict.get("opportunity_title", "")

@@ -218,3 +218,45 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
 - Property tests use Hypothesis; tag format: `# Feature: multi-portal-adapter-architecture, Property N: <text>`
 - The per-adapter `try/except Exception` in the orchestrator loop is a hard requirement — see design Error Handling section
 - `_is_latam_relevant()` in `SAMGovAdapter` is required because SAM.gov returns global results
+
+## Requirement 11 — Additional requirement traceability (documented, not directly verified)
+
+The following Requirement 11 clauses are implemented and documented in `design.md`
+but do NOT have a dedicated verifying test (do not treat them as verified):
+
+- [ ] Req 11.15 Exponential backoff `0.5 * 2^(attempt-1)` + jitter, clamped to the remaining deadline
+  - GAP: retry/backoff behavior is exercised (`test_transient_failure_then_success`, `test_repeated_transient_failures_exhaust_attempts`, `test_retry_after_numeric_respected`), but the exact exponential formula, jitter, and deadline-clamp calculation are not directly asserted.
+- [ ] Req 11.18 Enrichment_Deadline (120s) applies only to the Enrichment_Phase, excluding the listing-page fetch
+  - GAP: documented in `design.md`; no dedicated test proves the listing fetch is outside the enrichment deadline.
+- [ ] Req 11.19 Per-attempt detail-fetch request timeout of 12 seconds on the shared client
+  - GAP: shared-client construction/reuse is tested (`test_shared_client_reused`), but no test inspects the configured 12-second per-request timeout.
+
+## Requirement 11 (UNDP Description Enrichment) — Traceability
+
+UNDP-enrichment invariants and their verifying tests in
+`tests/test_undp_detail_fetch.py` (example-based; no Hypothesis/`@given`).
+`[x]` = fully verified on this branch; `[ ]` = partially verified or unverified
+(gap noted). No nonexistent tests are claimed.
+
+- [ ] 11-inv-17 Matching text authoritative/consistent across `passes_filter()` and `get_matched_keywords()` (Req 11.2)
+  - PARTIAL: `test_keyword_after_1000_chars_passes_filter_and_matched_keywords`, `test_non_undp_opportunity_filters_normally`; no test asserts both methods derive identical text from `get_matching_text()` for the same dict.
+- [ ] 11-inv-18 `_matching_text` precedence, `description_snippet` fallback (Req 11.3, 11.4)
+  - PARTIAL: fallback via `test_non_undp_opportunity_filters_normally`; precedence via `test_keyword_after_1000_chars_passes_filter_and_matched_keywords`; no dedicated `get_matching_text()` unit test asserts the exact rule.
+- [ ] 11-inv-19 Full `_matching_text` + bounded `description_snippet` (Req 11.5, 11.6)
+  - PARTIAL: `test_extract_overview_full_text_not_truncated` (full text), `test_keyword_after_1000_chars_passes_filter_and_matched_keywords` (snippet <= 1000, `_matching_text` present); exact `description_snippet == overview[:1000]` not asserted.
+- [x] 11-inv-20 Transient fields never reach the store (Req 11.7, 11.8)
+  - FULL: `test_matching_text_excluded_before_serialization`, `test_orchestration_end_to_end_keyword_after_1000`.
+- [x] 11-inv-21 Detail-fetch concurrency <= 8 (Req 11.9, 11.10, 11.11)
+  - FULL: `test_concurrency_bounded_and_expired_skipped` (`1 < peak <= _MAX_CONCURRENT_DETAIL_FETCHES`). Note: semaphore-release-during-backoff is separately covered by `test_semaphore_released_during_backoff`.
+- [x] 11-inv-22 Retryable vs permanent classification + bounded attempts (Req 11.12, 11.13, 11.14)
+  - FULL: `test_transient_failure_then_success`, `test_repeated_transient_failures_exhaust_attempts`, `test_404_gets_exactly_one_attempt`.
+- [x] 11-inv-23 Retry-After parsing (delay-seconds/HTTP-date/invalid) with clamp (Req 11.16, 11.17)
+  - FULL: `test_parse_retry_after_delay_seconds`, `test_parse_retry_after_http_date`, `test_parse_retry_after_invalid_returns_zero`, `test_retry_after_numeric_respected`.
+- [ ] 11-inv-24 Partial results preserved on deadline (Req 11.20, 11.21, 11.22, 11.23)
+  - PARTIAL: `test_timeout_preserves_completed_records` verifies preservation, cancellation-awaited (no pending), and exact warning counts (total=6, completed=5, fallback=0, cancelled=1); it does not directly assert the cancelled opportunity keeps a title-based `description_snippet` and is still passed to `KeywordFilter`.
+- [ ] 11-inv-25 Write exactly once (live) / no write (dry-run) (Req 11.24, 11.25)
+  - PARTIAL: `test_orchestration_end_to_end_keyword_after_1000` verifies exactly one live-mode `Store.write_record`; the dry-run no-write case is unverified.
+- [x] 11-inv-26 Deep-keyword end-to-end with clean storage, live mode (Req 11.5, 11.6, 11.25)
+  - FULL (live mode): `test_orchestration_end_to_end_keyword_after_1000`.
+
+Unverified/partial invariants above are follow-up test gaps, not regressions: 17, 18, 19; invariant 24's remaining gap is that a cancelled/failed opportunity retains its title-based `description_snippet` and is still passed through the `KeywordFilter` (not directly asserted); invariant 25's remaining gap is the dry-run no-write case. (The dry-run gap belongs only to invariant 25; invariant 24 has no dry-run component.)
