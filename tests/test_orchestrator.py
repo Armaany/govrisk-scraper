@@ -12,7 +12,7 @@ Properties tested:
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from hypothesis import given, settings
@@ -20,8 +20,13 @@ from hypothesis import strategies as st
 
 from main import build_adapter_registry, deduplicate_opportunities
 from portals.devex_adapter import DevexAdapter
+from portals.iadb_adapter import IADBAdapter
+from portals.oecd_adapter import OECDAdapter
 from portals.perplexity_adapter import PerplexityAdapter
 from portals.samgov_adapter import SAMGovAdapter
+from portals.undp_adapter import UNDPAdapter
+from portals.usaid_adapter import USAIDAdapter
+from portals.worldbank_adapter import WorldBankAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +36,11 @@ from portals.samgov_adapter import SAMGovAdapter
 @dataclass
 class StubConfig:
     devex_enabled: bool = True
+    undp_enabled: bool = False
+    worldbank_enabled: bool = False
+    usaid_enabled: bool = False
+    iadb_enabled: bool = False
+    oecd_enabled: bool = False
     samgov_enabled: bool = False
     perplexity_enabled: bool = False
     devex_email: str = "test@example.com"
@@ -88,6 +98,18 @@ def make_opp(opportunity_id: str = "", opportunity_link: str = "") -> dict:
     }
 
 
+FLAG_TO_ADAPTER = {
+    "devex_enabled": (DevexAdapter, "devex"),
+    "undp_enabled": (UNDPAdapter, "undp"),
+    "worldbank_enabled": (WorldBankAdapter, "worldbank"),
+    "usaid_enabled": (USAIDAdapter, "usaid"),
+    "iadb_enabled": (IADBAdapter, "iadb"),
+    "oecd_enabled": (OECDAdapter, "oecd"),
+    "samgov_enabled": (SAMGovAdapter, "samgov"),
+    "perplexity_enabled": (PerplexityAdapter, "perplexity"),
+}
+
+
 # ---------------------------------------------------------------------------
 # Property 5: Adapter registry contains exactly the enabled adapters
 # Validates: Requirements 6.1
@@ -95,167 +117,243 @@ def make_opp(opportunity_id: str = "", opportunity_link: str = "") -> dict:
 
 @given(
     devex_enabled=st.booleans(),
+    undp_enabled=st.booleans(),
+    worldbank_enabled=st.booleans(),
+    usaid_enabled=st.booleans(),
+    iadb_enabled=st.booleans(),
+    oecd_enabled=st.booleans(),
     samgov_enabled=st.booleans(),
     perplexity_enabled=st.booleans(),
 )
-@settings(max_examples=50)
+@settings(max_examples=100)
 def test_property_5_adapter_registry_contains_exactly_enabled_adapters(
-    devex_enabled, samgov_enabled, perplexity_enabled
+    devex_enabled,
+    undp_enabled,
+    worldbank_enabled,
+    usaid_enabled,
+    iadb_enabled,
+    oecd_enabled,
+    samgov_enabled,
+    perplexity_enabled,
 ):
     """Property 5: Adapter registry contains exactly the enabled adapters.
 
-    Validates: Requirements 6.1
+    # Feature: multi-portal-adapter-architecture, Property 5: Adapter registry contains exactly the enabled adapters
+
+    For arbitrary combinations of enabled flags, build_adapter_registry returns
+    adapters whose portal set matches exactly the set of enabled flags — no more,
+    no fewer.
+
+    **Validates: Requirements 6.1**
     """
+    flags = {
+        "devex_enabled": devex_enabled,
+        "undp_enabled": undp_enabled,
+        "worldbank_enabled": worldbank_enabled,
+        "usaid_enabled": usaid_enabled,
+        "iadb_enabled": iadb_enabled,
+        "oecd_enabled": oecd_enabled,
+        "samgov_enabled": samgov_enabled,
+        "perplexity_enabled": perplexity_enabled,
+    }
     config = StubConfig(
-        devex_enabled=devex_enabled,
-        samgov_enabled=samgov_enabled,
-        perplexity_enabled=perplexity_enabled,
+        **flags,
         samgov_api_key="key" if samgov_enabled else None,
         perplexity_api_key="key" if perplexity_enabled else None,
     )
 
-    adapters = asyncio.get_event_loop().run_until_complete(build_adapter_registry(config))
+    adapters = asyncio.run(build_adapter_registry(config))
 
-    # Count expected adapters
-    expected_count = sum([devex_enabled, samgov_enabled, perplexity_enabled])
+    # The registry must contain exactly one adapter per enabled flag.
+    expected_count = sum(flags.values())
     assert len(adapters) == expected_count
 
-    # Verify correct types are present / absent
-    adapter_types = [type(a) for a in adapters]
-    if devex_enabled:
-        assert DevexAdapter in adapter_types
-    else:
-        assert DevexAdapter not in adapter_types
+    # The set of portal names must equal exactly the set of enabled portals.
+    expected_portals = {
+        FLAG_TO_ADAPTER[flag][1] for flag, enabled in flags.items() if enabled
+    }
+    actual_portals = {a.portal_name for a in adapters}
+    assert actual_portals == expected_portals
 
-    if samgov_enabled:
-        assert SAMGovAdapter in adapter_types
-    else:
-        assert SAMGovAdapter not in adapter_types
-
-    if perplexity_enabled:
-        assert PerplexityAdapter in adapter_types
-    else:
-        assert PerplexityAdapter not in adapter_types
+    # Each enabled flag maps to an instance of the correct adapter type; each
+    # disabled flag has no corresponding instance.
+    adapter_types = {type(a) for a in adapters}
+    for flag, (adapter_cls, _portal) in FLAG_TO_ADAPTER.items():
+        if flags[flag]:
+            assert adapter_cls in adapter_types
+        else:
+            assert adapter_cls not in adapter_types
 
 
 # ---------------------------------------------------------------------------
-# Property 6: Unified list is the union of all adapter results
+# Shared helper: run the REAL main.run_scraper() with external collaborators
+# mocked, capturing every opportunity that reaches the production pipeline
+# boundary KeywordFilter.passes_filter(). Does NOT reimplement main.py logic.
+# ---------------------------------------------------------------------------
+
+def _run_scraper_capturing_filter(fake_adapters):
+    """Invoke the real `main.run_scraper()` with only external collaborators
+    mocked (config, store, audit, notifier, LLM, KeywordFilter, and
+    build_adapter_registry). Returns (filtered_opps, audit_mock, notifier_mock).
+
+    `filtered_opps` is the ordered list of opportunity dicts passed to
+    `KeywordFilter.passes_filter()` — the real collection + dedup + pipeline
+    path in `main.py`. `passes_filter` returns False so the run stops at the
+    filter boundary (no LLM/store needed to prove the opportunities arrived).
+    """
+    import main
+
+    filtered_opps = []
+
+    cfg = MagicMock()
+    cfg.run_mode = "dry_run"
+    cfg.store_type = "sheets"
+    cfg.max_results = 10
+
+    store = MagicMock()
+    store.test_connection.return_value = True
+    store.get_all_ids.return_value = set()
+
+    def _record_and_reject(opp):
+        filtered_opps.append(opp)
+        return False
+
+    kf = MagicMock()
+    kf.passes_filter.side_effect = _record_and_reject
+
+    audit = MagicMock()
+    notifier = MagicMock()
+
+    async def _fake_registry(config):
+        return list(fake_adapters)
+
+    with patch("main.load_config", return_value=cfg), \
+         patch("main.SheetsAdapter", return_value=store), \
+         patch("main.AirtableAdapter", return_value=store), \
+         patch("main.AuditLogger", return_value=audit), \
+         patch("main.Notifier", return_value=notifier), \
+         patch("main.KeywordFilter", return_value=kf), \
+         patch("main.LLMInterpreter", return_value=MagicMock()), \
+         patch("main.build_adapter_registry", side_effect=_fake_registry):
+        asyncio.run(main.run_scraper())
+
+    return filtered_opps, audit, notifier
+
+
+# ---------------------------------------------------------------------------
+# Property 6: Unified list is the union of all adapter results (real pipeline)
 # Validates: Requirements 6.2
 # ---------------------------------------------------------------------------
 
-@given(
-    results_a=st.lists(st.integers(min_value=0, max_value=20), min_size=0, max_size=5),
-    results_b=st.lists(st.integers(min_value=0, max_value=20), min_size=0, max_size=5),
-    results_c=st.lists(st.integers(min_value=0, max_value=20), min_size=0, max_size=5),
-)
-@settings(max_examples=100)
-def test_property_6_unified_list_is_union_of_adapter_results(results_a, results_b, results_c):
-    """Property 6: Unified list is the union of all adapter results.
+@given(result_sizes=st.lists(st.integers(min_value=0, max_value=6), min_size=0, max_size=8))
+@settings(max_examples=30)
+def test_property_6_unified_list_is_union_of_adapter_results(result_sizes):
+    """Property 6: every opportunity from every healthy adapter reaches the real
+    production pipeline boundary (KeywordFilter.passes_filter), in the exact
+    collected order — exercised through the real `main.run_scraper()` collection
+    loop (no test-local `list.extend`).
 
-    For any set of active adapters each returning any number of results, the unified
-    list collected before deduplication must have length equal to the sum of all
-    individual adapter result lengths.
+    # Feature: multi-portal-adapter-architecture, Property 6: Unified list is the union of all adapter results
 
-    Validates: Requirements 6.2
+    **Validates: Requirements 6.2**
     """
-    # Build unique opportunity dicts for each "adapter" result set
-    def make_opps(sizes, prefix):
-        return [make_opp(opportunity_id=f"{prefix}-{i}", opportunity_link=f"https://{prefix}-{i}.example.com") for i in range(sizes)]
+    per_adapter_results = [
+        [
+            make_opp(
+                opportunity_id=f"p{a_idx}-{i}",
+                opportunity_link=f"https://p{a_idx}-{i}.example.com",
+            )
+            for i in range(size)
+        ]
+        for a_idx, size in enumerate(result_sizes)
+    ]
+    fake_adapters = []
+    for a_idx, opps in enumerate(per_adapter_results):
+        ad = MagicMock()
+        ad.portal_name = f"portal-{a_idx}"
+        ad.fetch_opportunities = AsyncMock(return_value=opps)
+        fake_adapters.append(ad)
 
-    opps_a = make_opps(len(results_a), "a")
-    opps_b = make_opps(len(results_b), "b")
-    opps_c = make_opps(len(results_c), "c")
+    filtered, _audit, _notifier = _run_scraper_capturing_filter(fake_adapters)
 
-    # Simulate the unified adapter loop
-    all_opportunities: list[dict] = []
-    for adapter_results in [opps_a, opps_b, opps_c]:
-        all_opportunities.extend(adapter_results)
+    # Every collected opportunity reached passes_filter in the correct order.
+    # (Fails if main.py stops collecting any adapter's results.)
+    expected = [opp for opps in per_adapter_results for opp in opps]
+    assert filtered == expected
 
-    expected_total = len(opps_a) + len(opps_b) + len(opps_c)
-    assert len(all_opportunities) == expected_total
+    # Each adapter was awaited exactly once by the real orchestrator.
+    for ad in fake_adapters:
+        assert ad.fetch_opportunities.await_count == 1
 
 
 # ---------------------------------------------------------------------------
-# Property 7: Failing adapters do not suppress results from healthy adapters
+# Property 7: Failing adapters do not suppress healthy results (real pipeline)
 # Validates: Requirements 6.4
 # ---------------------------------------------------------------------------
 
 @given(
-    healthy_results=st.lists(
-        st.integers(min_value=0, max_value=10),
+    adapter_specs=st.lists(
+        st.tuples(st.booleans(), st.integers(min_value=0, max_value=5)),
         min_size=1,
-        max_size=10,
+        max_size=8,
     ),
-    num_failing=st.integers(min_value=1, max_value=3),
 )
-@settings(max_examples=100)
-def test_property_7_failing_adapters_do_not_suppress_healthy_results(
-    healthy_results, num_failing
-):
-    """Property 7: Failing adapters do not suppress results from healthy adapters.
+@settings(max_examples=30)
+def test_property_7_failing_adapters_do_not_suppress_healthy_results(adapter_specs):
+    """Property 7: with arbitrarily interleaved healthy/failing adapters, the
+    real `main.run_scraper()` isolates failures — every adapter is awaited once,
+    every healthy opportunity reaches the pipeline (including adapters after an
+    earlier failure), each failing adapter yields an audit error + notifier
+    alert, and the completion summary reports the exact failure count. Does not
+    reproduce main.py's try/except loop.
 
-    For any set of adapters where a random subset raises exceptions, the opportunities
-    returned by the non-failing adapters must all appear in the final unified list.
+    # Feature: multi-portal-adapter-architecture, Property 7: Failing adapters do not suppress results from healthy adapters
 
-    Validates: Requirements 6.4
+    **Validates: Requirements 6.4**
     """
-    config = StubConfig()
-    audit = MagicMock()
-    audit.log_error = MagicMock()
-    audit.log = MagicMock()
-    notifier = MagicMock()
-    notifier.send_error_alert = MagicMock()
+    fake_adapters = []
+    expected_healthy = []
+    failing_portals = []
+    for a_idx, (is_healthy, size) in enumerate(adapter_specs):
+        ad = MagicMock()
+        ad.portal_name = f"portal-{a_idx}"
+        if is_healthy:
+            opps = [
+                make_opp(
+                    opportunity_id=f"h-{a_idx}-{i}",
+                    opportunity_link=f"https://h-{a_idx}-{i}.example.com",
+                )
+                for i in range(size)
+            ]
+            expected_healthy.extend(opps)
+            ad.fetch_opportunities = AsyncMock(return_value=opps)
+        else:
+            failing_portals.append(f"portal-{a_idx}")
+            ad.fetch_opportunities = AsyncMock(side_effect=RuntimeError(f"boom-{a_idx}"))
+        fake_adapters.append(ad)
 
-    # Build healthy opportunities
-    healthy_opps = [
-        make_opp(
-            opportunity_id=f"healthy-{i}",
-            opportunity_link=f"https://healthy-{i}.example.com",
-        )
-        for i in range(len(healthy_results))
-    ]
+    expected_failures = len(failing_portals)
 
-    # Simulate the orchestrator loop with failing + healthy adapters
-    all_opportunities: list[dict] = []
-    errors = 0
+    filtered, audit, notifier = _run_scraper_capturing_filter(fake_adapters)
 
-    # Failing adapters come first
-    for _ in range(num_failing):
-        failing_adapter = MagicMock()
-        failing_adapter.portal_name = "failing-portal"
-        failing_adapter.fetch_opportunities = AsyncMock(side_effect=RuntimeError("adapter failed"))
-        try:
-            result = asyncio.get_event_loop().run_until_complete(
-                failing_adapter.fetch_opportunities()
-            )
-            all_opportunities.extend(result)
-        except Exception as exc:
-            errors += 1
-            audit.log_error(str(exc))
-            notifier.send_error_alert(str(exc), component=failing_adapter.portal_name)
-            continue
+    # Every adapter awaited exactly once (later adapters ran despite failures).
+    for ad in fake_adapters:
+        assert ad.fetch_opportunities.await_count == 1
 
-    # Healthy adapter runs after failing ones
-    healthy_adapter = MagicMock()
-    healthy_adapter.portal_name = "healthy-portal"
-    healthy_adapter.fetch_opportunities = AsyncMock(return_value=healthy_opps)
-    try:
-        result = asyncio.get_event_loop().run_until_complete(
-            healthy_adapter.fetch_opportunities()
-        )
-        all_opportunities.extend(result)
-    except Exception as exc:
-        errors += 1
-        audit.log_error(str(exc))
-        notifier.send_error_alert(str(exc), component=healthy_adapter.portal_name)
+    # Every healthy opportunity reached the pipeline, in collected order.
+    assert filtered == expected_healthy
 
-    # All healthy results must be present
-    assert len(all_opportunities) == len(healthy_opps)
-    for opp in healthy_opps:
-        assert opp in all_opportunities
+    # Each failing adapter produced an audit error and a notifier alert naming it.
+    assert audit.log_error.call_count == expected_failures
+    assert notifier.send_error_alert.call_count == expected_failures
+    alerted = [c.kwargs.get("component") for c in notifier.send_error_alert.call_args_list]
+    for portal in failing_portals:
+        assert portal in alerted
 
-    # Errors were counted for failing adapters
-    assert errors == num_failing
+    # The completion summary reports the exact failure count.
+    summary_calls = notifier.send_completion_summary.call_args_list
+    assert len(summary_calls) == 1
+    assert summary_calls[0].kwargs.get("errors") == expected_failures
 
 
 # ---------------------------------------------------------------------------
@@ -392,3 +490,52 @@ def test_deduplication_skips_ids_already_in_store(ids):
 
     assert len(deduplicated) == 0
     assert skipped == len(ids)
+
+# ---------------------------------------------------------------------------
+# Property 7 (deterministic regression): a failing adapter FOLLOWED BY a healthy
+# adapter. Hypothesis Property 7 cannot guarantee this exact ordering appears in
+# a generated example, so this permanently proves the failure-before-success
+# path (later healthy adapter still runs and its opportunity reaches the
+# pipeline).
+# Validates: Requirements 6.4
+# ---------------------------------------------------------------------------
+
+def test_property_7_failure_before_success_healthy_adapter_still_runs():
+    """Deterministic: failing adapter, then healthy adapter with one unique opp.
+
+    # Feature: multi-portal-adapter-architecture, Property 7 (deterministic): failing adapter followed by healthy adapter
+
+    **Validates: Requirements 6.4**
+    """
+    failing = MagicMock()
+    failing.portal_name = "failing-portal"
+    failing.fetch_opportunities = AsyncMock(side_effect=RuntimeError("boom"))
+
+    healthy_opp = make_opp(
+        opportunity_id="healthy-after-failure-1",
+        opportunity_link="https://healthy-after-failure-1.example.com",
+    )
+    healthy = MagicMock()
+    healthy.portal_name = "healthy-portal"
+    healthy.fetch_opportunities = AsyncMock(return_value=[healthy_opp])
+
+    fake_adapters = [failing, healthy]  # failure BEFORE success
+
+    filtered, audit, notifier = _run_scraper_capturing_filter(fake_adapters)
+
+    # Both adapters awaited exactly once (healthy ran after the earlier failure).
+    assert failing.fetch_opportunities.await_count == 1
+    assert healthy.fetch_opportunities.await_count == 1
+
+    # The later healthy opportunity reached KeywordFilter.passes_filter().
+    assert filtered == [healthy_opp]
+
+    # Exactly one audit error and one notifier alert naming the failing portal.
+    assert audit.log_error.call_count == 1
+    assert notifier.send_error_alert.call_count == 1
+    assert notifier.send_error_alert.call_args_list[0].kwargs.get("component") == "failing-portal"
+
+    # Completion summary reports errors=1.
+    summary_calls = notifier.send_completion_summary.call_args_list
+    assert len(summary_calls) == 1
+    assert summary_calls[0].kwargs.get("errors") == 1
