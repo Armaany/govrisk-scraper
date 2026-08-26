@@ -20,6 +20,11 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 - **Portal**: An external data source (website, REST API, or AI search) from which procurement opportunities are fetched.
 - **Active_Adapter**: An adapter whose corresponding `ENABLED` flag in `Config` is `True`.
 - **Opportunity_Dict**: A plain Python `dict` with the normalized field set returned by every adapter's `fetch_opportunities()` method.
+- **UNDP_Adapter**: The `portals/undp_adapter.py` `UNDPAdapter` class that scrapes the UNDP Procurement Notices portal and enriches listings with detail-page Overview text.
+- **Matching_Text**: The full searchable text used exclusively for keyword matching, carried on an `Opportunity_Dict` under the transient key `_matching_text` (constant `MATCHING_TEXT_KEY` in `engine/keyword_filter.py`). Distinct from `description_snippet`, which is a truncated display/storage value.
+- **Transient_Field**: An `Opportunity_Dict` key (`_matching_text` and `_full_overview`) that exists only in memory during a run and MUST be removed before an `OpportunityRecord` is constructed or written to any `Store`.
+- **Enrichment_Phase**: The bounded-concurrency detail-page fetching stage in `UNDP_Adapter` during which each active listing's detail page is retrieved to extract full Overview text; governed by the `_DETAIL_ENRICHMENT_DEADLINE` of 120 seconds.
+- **Enrichment_Deadline**: The 120-second wall-clock budget (`_DETAIL_ENRICHMENT_DEADLINE`) applied to the Enrichment_Phase only, excluding the listing-page fetch.
 
 ---
 
@@ -159,3 +164,35 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 2. THE `SAMGov_Adapter` SHALL set `opportunity_id` in each `Opportunity_Dict` using the format `samgov-{noticeId}` where `noticeId` is the SAM.gov API field.
 3. THE `Perplexity_Adapter` SHALL set `opportunity_id` in each `Opportunity_Dict` using the format `perplexity-{hash}` where `hash` is a deterministic hash of the `opportunity_link`.
 4. WHEN two adapters return an `Opportunity_Dict` with the same `opportunity_id`, THE `Orchestrator` SHALL treat the second occurrence as a duplicate and skip it.
+
+### Requirement 11: UNDP Description Enrichment and Full-Text Keyword Matching
+
+**User Story:** As an operator, I want UNDP opportunities to be keyword-matched against the full detail-page Overview text rather than a truncated snippet, so that relevant opportunities are captured even when the matching keyword appears deep in the description, without leaking transient enrichment data into the store.
+
+#### Acceptance Criteria
+
+1. THE `engine/keyword_filter.py` module SHALL define the constant `MATCHING_TEXT_KEY` with the value `"_matching_text"`.
+2. THE `KeywordFilter.get_matching_text(parsed)` method SHALL return a two-tuple of `(normalized_title, normalized_searchable_text)` and SHALL be the sole source of searchable text used by both `KeywordFilter.passes_filter()` and `KeywordFilter.get_matched_keywords()`, so both methods observe identical searchable text for the same `Opportunity_Dict`.
+3. WHERE an `Opportunity_Dict` carries a non-empty `_matching_text` value, THE `KeywordFilter.get_matching_text()` method SHALL use that value as the searchable text.
+4. IF an `Opportunity_Dict` has no `_matching_text` value or an empty `_matching_text` value, THEN THE `KeywordFilter.get_matching_text()` method SHALL use `description_snippet` as the searchable text.
+5. WHEN the `UNDP_Adapter` successfully extracts the Overview text from a detail page, THE `UNDP_Adapter` SHALL set the `_matching_text` field to the complete extracted Overview text with no truncation.
+6. WHEN the `UNDP_Adapter` successfully extracts the Overview text from a detail page, THE `UNDP_Adapter` SHALL set `description_snippet` to the extracted Overview text truncated to at most 1000 characters; WHILE a non-empty `_matching_text` is present, THE `description_snippet` value SHALL NOT be used for keyword matching. THE `description_snippet` remains the compatibility/failure fallback used for keyword matching only for unenriched and non-UNDP opportunities (per 11.4).
+7. WHEN the `Orchestrator` prepares an opportunity for persistence, THE `Orchestrator` SHALL remove the `_matching_text` and `_full_overview` fields (via `merged.pop`) before constructing the `OpportunityRecord`, so that neither field is written to Google Sheets or Airtable.
+8. THE enrichment behavior SHALL NOT introduce any new column or field in the `Store` beyond the fields already defined for `OpportunityRecord`.
+9. WHILE the `UNDP_Adapter` performs detail-page fetches, THE `UNDP_Adapter` SHALL bound concurrent detail-page HTTP requests to a maximum of 8 simultaneous requests using an `asyncio.Semaphore`.
+10. THE `UNDP_Adapter` SHALL acquire the concurrency semaphore around each individual `client.get()` network attempt only, and SHALL release the semaphore before performing any retry backoff sleep, so that a request awaiting backoff does not hold a concurrency permit.
+11. THE `UNDP_Adapter` SHALL perform retry counting and backoff sleeping outside the region protected by the concurrency semaphore.
+12. THE `UNDP_Adapter` SHALL attempt each detail-page fetch at most 3 times.
+13. WHEN a detail-page fetch encounters a connection error, a timeout, or an HTTP status of 429, 500, 502, 503, or 504, THE `UNDP_Adapter` SHALL treat the failure as retryable and retry until the 3-attempt limit is reached.
+14. IF a detail-page fetch returns an HTTP status of 400, 401, 403, or 404, THEN THE `UNDP_Adapter` SHALL treat the failure as permanent and SHALL NOT retry that fetch.
+15. WHEN the `UNDP_Adapter` computes a retry backoff delay, THE `UNDP_Adapter` SHALL use exponential backoff of `0.5 * 2^(attempt-1)` seconds plus random jitter, clamped to the remaining Enrichment_Deadline.
+16. WHEN a retryable detail-page response includes a `Retry-After` header, THE `UNDP_Adapter` SHALL honor the header in both the delay-seconds format and the HTTP-date (RFC 7231) format, and SHALL clamp the resulting wait to the remaining Enrichment_Deadline.
+17. IF a `Retry-After` header value cannot be parsed as either delay-seconds or an HTTP-date, THEN THE `UNDP_Adapter` SHALL fall back to the exponential backoff delay.
+18. THE Enrichment_Deadline of 120 seconds SHALL apply only to the Enrichment_Phase and SHALL NOT constrain the listing-page fetch, which SHALL use the shared HTTP client's per-request timeout.
+19. THE `UNDP_Adapter` SHALL apply a per-attempt request timeout of 12 seconds to each individual detail-page fetch attempt.
+20. WHEN the Enrichment_Deadline is reached, THE `UNDP_Adapter` SHALL cancel all still-pending enrichment tasks and await them via `gather(..., return_exceptions=True)` so that no enrichment task remains pending.
+21. WHEN an opportunity's enrichment completes successfully before the Enrichment_Deadline, THE `UNDP_Adapter` SHALL retain that opportunity's enriched `_matching_text` and `description_snippet` values.
+22. WHEN an opportunity's enrichment is cancelled or fails, THE `UNDP_Adapter` SHALL fall back to the title-based `description_snippet` for that opportunity and SHALL still pass that opportunity through the `KeywordFilter`.
+23. WHEN the Enrichment_Deadline causes one or more enrichment tasks to be cancelled, THE `UNDP_Adapter` SHALL log a warning containing the total, completed, fallback, and cancelled counts. No such warning is emitted when enrichment completes without any cancellation.
+24. WHEN `main.run_scraper()` processes the unified deduplicated opportunity list, THE `Orchestrator` SHALL apply the `KeywordFilter` a second time over that list, strip the Transient_Fields, construct an `OpportunityRecord` for each passing opportunity, and — while in live run mode — call `Store.write_record` exactly once per passing opportunity.
+25. WHEN an opportunity's only matching sector keyword appears after character 1000 of its `_matching_text` value while its `description_snippet` is exactly 1000 characters and contains no matching keyword, THE `Orchestrator` SHALL pass that opportunity through the `KeywordFilter`, record the correct matched keyword, retain a `description_snippet` of at most 1000 characters, and produce a stored record in which the `_matching_text` and `_full_overview` fields are absent; WHILE in live run mode THE `Orchestrator` SHALL call `Store.write_record` exactly once for that passing opportunity, and WHILE in `dry_run` mode THE `Orchestrator` SHALL NOT call `Store.write_record` for that opportunity.

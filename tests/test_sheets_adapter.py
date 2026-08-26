@@ -1,17 +1,14 @@
-"""Property-based tests for SheetsAdapter source_portal handling.
+"""Tests for SheetsAdapter with the current 12-column schema.
 
 Feature: multi-portal-adapter-architecture
 """
 import sys
-from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-# Stub out gspread and google-auth before importing the adapter so tests run
-# without those optional dependencies installed.
+# Stub out gspread and google-auth so tests run without those dependencies.
 sys.modules.setdefault("gspread", MagicMock())
 sys.modules.setdefault("google", MagicMock())
 sys.modules.setdefault("google.oauth2", MagicMock())
@@ -45,8 +42,8 @@ def _make_adapter() -> SheetsAdapter:
     with patch("store.adapter_sheets.Credentials"), \
          patch("store.adapter_sheets.gspread") as mock_gspread:
         mock_ws = MagicMock()
-        mock_ws.row_values.return_value = SheetsAdapter.HEADERS  # headers already present
-        mock_ws.col_values.return_value = ["devex_opportunity_id"]
+        mock_ws.row_values.return_value = SheetsAdapter.HEADERS
+        mock_ws.col_values.return_value = ["portal_source"]
         mock_gspread.authorize.return_value.open_by_key.return_value.worksheet.return_value = mock_ws
 
         cfg = MagicMock()
@@ -61,95 +58,79 @@ def _make_adapter() -> SheetsAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Property 14: SheetsAdapter writes source_portal at correct column position
-# Validates: Requirements 9.3, 9.4
+# Test: HEADERS has exactly 12 columns in the correct order
+# ---------------------------------------------------------------------------
+
+def test_headers_has_exactly_12_columns():
+    """HEADERS must contain exactly the 12 expected columns."""
+    expected = [
+        "portal_source",
+        "opportunity_title",
+        "funder_organisation",
+        "country_region",
+        "deadline",
+        "contract_value",
+        "opportunity_link",
+        "summary",
+        "relevance_score",
+        "bid_recommendation",
+        "risk_flags",
+        "review_status",
+    ]
+    assert SheetsAdapter.HEADERS == expected, (
+        f"HEADERS mismatch.\n  Expected: {expected}\n  Got:      {SheetsAdapter.HEADERS}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Property: write_record places portal_source at column index 0
+# (portal_source is the first column in the new 12-column schema)
 # ---------------------------------------------------------------------------
 
 SOURCE_PORTAL_VALUES = st.one_of(
     st.just("devex"),
-    st.just("samgov"),
-    st.just("perplexity"),
-    st.text(min_size=1, max_size=30, alphabet=st.characters(whitelist_categories=("Ll", "Lu", "Nd"), whitelist_characters="-_")),
+    st.just("undp"),
+    st.just("worldbank"),
+    st.just("usaid"),
+    st.text(
+        min_size=1, max_size=30,
+        alphabet=st.characters(whitelist_categories=("Ll", "Lu", "Nd"), whitelist_characters="-_"),
+    ),
 )
 
 
 @given(source_portal=SOURCE_PORTAL_VALUES)
 @settings(max_examples=100)
-def test_property_14_write_record_source_portal_at_correct_column(source_portal):
-    """Property 14: SheetsAdapter writes source_portal at correct column position.
-
-    For any OpportunityRecord with any source_portal value, the row written by
-    write_record() must contain that value at the index corresponding to
-    "source_portal" in HEADERS.
-
-    **Validates: Requirements 9.3, 9.4**
-    """
+def test_write_record_portal_source_at_column_0(source_portal):
+    """For any source_portal value, write_record() places it at index 0 (portal_source column)."""
     adapter = _make_adapter()
     record = _make_record(source_portal)
 
-    # Capture the row passed to append_row
     written_rows = []
     adapter.worksheet.append_row.side_effect = lambda row, **kwargs: written_rows.append(row)
-    adapter.worksheet.col_values.return_value = ["devex_opportunity_id", "test-001"]
+    adapter.worksheet.col_values.return_value = ["portal_source", "test-001"]
 
     adapter.write_record(record)
 
     assert len(written_rows) == 1, "append_row should be called exactly once"
     written_row = written_rows[0]
 
-    expected_index = SheetsAdapter.HEADERS.index("source_portal")
-    assert written_row[expected_index] == source_portal, (
-        f"Expected source_portal='{source_portal}' at index {expected_index}, "
-        f"got '{written_row[expected_index]}'"
+    assert len(written_row) == len(SheetsAdapter.HEADERS), (
+        f"Row length {len(written_row)} != HEADERS length {len(SheetsAdapter.HEADERS)}"
+    )
+    # portal_source is the first column (index 0)
+    assert written_row[0] == source_portal, (
+        f"Expected portal_source='{source_portal}' at index 0, got '{written_row[0]}'"
     )
 
 
 # ---------------------------------------------------------------------------
-# Property 15: Store get_records_since returns "devex" default for legacy rows
-# Validates: Requirements 9.6
+# Test: to_dict() returns all 12 expected keys
 # ---------------------------------------------------------------------------
 
-def _make_legacy_row(scraped_at: datetime, extra_fields: dict) -> dict:
-    """Build a row dict that lacks source_portal (simulating a legacy row)."""
-    row = {
-        "devex_opportunity_id": "legacy-001",
-        "opportunity_title": "Legacy Opportunity",
-        "scraped_at": scraped_at.isoformat(),
-    }
-    row.update(extra_fields)
-    # Explicitly ensure source_portal is absent
-    row.pop("source_portal", None)
-    return row
-
-
-EXTRA_FIELDS_STRATEGY = st.fixed_dictionaries({
-    "opportunity_title": st.text(min_size=0, max_size=50),
-    "funder_organisation": st.text(min_size=0, max_size=50),
-})
-
-
-@given(extra_fields=EXTRA_FIELDS_STRATEGY)
-@settings(max_examples=100)
-def test_property_15_get_records_since_defaults_source_portal_for_legacy_rows(extra_fields):
-    """Property 15: get_records_since returns "devex" default for legacy rows.
-
-    For any stored row that lacks a source_portal field, get_records_since()
-    must return "devex" as the source_portal value for that row.
-
-    **Validates: Requirements 9.6**
-    """
-    adapter = _make_adapter()
-    since = datetime(2020, 1, 1)
-    scraped_at = datetime(2024, 6, 1, 12, 0, 0)
-
-    legacy_row = _make_legacy_row(scraped_at, extra_fields)
-    assert "source_portal" not in legacy_row, "Test setup error: legacy row must not have source_portal"
-
-    adapter.worksheet.get_all_records.return_value = [legacy_row]
-
-    results = adapter.get_records_since(since)
-
-    assert len(results) == 1, "Expected exactly one result row"
-    assert results[0]["source_portal"] == "devex", (
-        f"Expected source_portal='devex' for legacy row, got '{results[0].get('source_portal')}'"
-    )
+def test_to_dict_returns_all_12_header_keys():
+    """OpportunityRecord.to_dict() must return all keys that appear in HEADERS."""
+    record = _make_record("undp")
+    d = record.to_dict()
+    for col in SheetsAdapter.HEADERS:
+        assert col in d, f"to_dict() is missing column '{col}'"

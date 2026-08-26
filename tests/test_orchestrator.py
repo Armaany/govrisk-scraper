@@ -33,6 +33,11 @@ class StubConfig:
     devex_enabled: bool = True
     samgov_enabled: bool = False
     perplexity_enabled: bool = False
+    undp_enabled: bool = False
+    worldbank_enabled: bool = False
+    usaid_enabled: bool = False
+    iadb_enabled: bool = False
+    oecd_enabled: bool = False
     devex_email: str = "test@example.com"
     devex_password: str = "password"
     devex_session_path: str = "./devex_session.json"

@@ -158,6 +158,9 @@ async def run_scraper():
                 llm_result = {}
 
             merged = {**opp, **llm_result}
+            # Strip transient fields before serialization — they must not leak to Sheets
+            merged.pop("_matching_text", None)
+            merged.pop("_full_overview", None)
             record = OpportunityRecord.from_dict(merged)
 
             if config.run_mode == "live":

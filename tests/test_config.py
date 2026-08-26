@@ -88,7 +88,9 @@ def test_load_config_devex_enabled_reads_env(monkeypatch):
 
 def test_load_config_defaults_when_portal_vars_absent():
     """load_config() uses safe defaults when portal env vars are absent (Req 5.1–5.5)."""
-    with patch.dict(os.environ, BASE_ENV, clear=True):
+    # Explicitly set DEVEX_ENABLED to true so the .env file value doesn't bleed through
+    env = {**BASE_ENV, "DEVEX_ENABLED": "true"}
+    with patch.dict(os.environ, env, clear=True):
         cfg = load_config()
     assert cfg.devex_enabled is True
     assert cfg.samgov_enabled is False

@@ -1,54 +1,89 @@
-"""UNDPAdapter — scrapes UNDP Procurement Notices portal using requests + BeautifulSoup."""
+"""UNDPAdapter — scrapes UNDP Procurement Notices portal.
+
+v3: Unified _matching_text, shared httpx client, retry/backoff for transient errors,
+bounded concurrency, explicit task management for timeout preservation.
+
+Deadline policy: _ADAPTER_LEVEL_TIMEOUT (120s) applies to detail-page enrichment only.
+The listing-page fetch has its own separate timeout (part of the shared client config).
+"""
+import asyncio
 import hashlib
 import logging
+import random
 import re
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from urllib.parse import urljoin
 
-import requests
+import httpx
 from bs4 import BeautifulSoup
 
-from engine.keyword_filter import KeywordFilter
+from engine.keyword_filter import MATCHING_TEXT_KEY, KeywordFilter
 from portals.base_adapter import BasePortalAdapter
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://procurement-notices.undp.org"
 
-# LATAM region class applied by UNDP to each <a> card — used for client-side filtering
 _LATAM_REGION_CLASS = "region_RLA"
 
-# Maximum characters to keep from the detail page description
-_DESCRIPTION_MAX_CHARS = 1000
+# Concurrency and timeout settings
+_MAX_CONCURRENT_DETAIL_FETCHES = 8
+_DETAIL_REQUEST_TIMEOUT = 12  # seconds per individual request attempt
+_DETAIL_ENRICHMENT_DEADLINE = 120  # seconds — detail enrichment phase must complete within this
+
+# Retry settings — only for transient failures
+_MAX_ATTEMPTS = 3
+_BASE_BACKOFF = 0.5  # seconds — multiplied by 2^attempt with jitter
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_PERMANENT_FAIL_STATUS_CODES = {400, 401, 403, 404}
+
+# Display/storage truncation (NOT used for keyword matching)
+_DESCRIPTION_DISPLAY_MAX = 1000
+
+
+def _parse_retry_after(value: str, remaining_deadline: float) -> float:
+    """Parse Retry-After header value (delay-seconds or HTTP-date).
+
+    Returns the number of seconds to wait, clamped to remaining_deadline.
+    Falls back to 0 if unparseable.
+    """
+    if not value:
+        return 0
+    # Try delay-seconds first
+    try:
+        delay = float(value)
+        return min(delay, remaining_deadline)
+    except ValueError:
+        pass
+    # Try HTTP-date (RFC 7231)
+    try:
+        target_dt = parsedate_to_datetime(value)
+        now = datetime.now(target_dt.tzinfo) if target_dt.tzinfo else datetime.utcnow()
+        delay = max(0, (target_dt - now).total_seconds())
+        return min(delay, remaining_deadline)
+    except (ValueError, TypeError, OverflowError):
+        return 0
 
 
 def _parse_deadline(raw: Optional[str]) -> Optional[str]:
-    """Parse a UNDP deadline string like '06-May-26' or '30-Apr-2604:00 AM' into YYYY-MM-DD."""
+    """Parse '06-May-26' or '30-Apr-2604:00 AM' into YYYY-MM-DD."""
     if not raw:
         return None
     raw = raw.strip()
-    # Extract date part: DD-Mon-YY (possibly followed immediately by time digits)
     match = re.match(r"(\d{1,2}-[A-Za-z]{3}-\d{2})", raw)
     if not match:
         return None
-    date_str = match.group(1)
     try:
-        parsed = datetime.strptime(date_str, "%d-%b-%y")
+        parsed = datetime.strptime(match.group(1), "%d-%b-%y")
         return parsed.date().isoformat()
     except ValueError:
         return None
 
 
-def _extract_cell(card: BeautifulSoup, label: str) -> Optional[str]:
-    """Extract the value span from a vacanciesTable__cell matching the given label.
-
-    Each cell has structure:
-      <div class="vacanciesTable__cell">
-        <div class="vacanciesTable__cell__label">Deadline</div>
-        <span>06-May-26</span>
-      </div>
-    """
+def _extract_cell(card, label: str) -> Optional[str]:
+    """Extract span value from a vacanciesTable__cell matching the given label."""
     label_lower = label.lower().strip()
     for cell in card.find_all("div", class_="vacanciesTable__cell"):
         label_div = cell.find("div", class_="vacanciesTable__cell__label")
@@ -56,52 +91,56 @@ def _extract_cell(card: BeautifulSoup, label: str) -> Optional[str]:
             span = cell.find("span")
             if span:
                 return span.get_text(strip=True) or None
-            # Fallback: get the cell text minus the label text
             full_text = cell.get_text(" ", strip=True)
             label_text = label_div.get_text(strip=True)
-            value = full_text[len(label_text):].strip()
-            return value or None
+            return full_text[len(label_text):].strip() or None
     return None
 
 
-def _fetch_detail_description(url: str) -> Optional[str]:
-    """Fetch the UNDP detail page and extract the Overview/body description text.
+def _extract_overview_from_detail(html: str) -> Optional[str]:
+    """Extract the Overview section from a UNDP detail page.
 
-    The detail page contains several ``div.postContent`` sections:
-    - "Link to Atlas Project"
-    - "Documents"
-    - "Overview"  ← this is the one with real descriptive content
-
-    We return the text of the largest postContent block (which is always Overview)
-    truncated to _DESCRIPTION_MAX_CHARS, or None if the request fails.
+    Strategy (per spec AC 3):
+      1. Look for a postContent div whose <h2> heading contains "Overview"
+      2. If not found, fall back to the longest postContent block and log
+      3. Return the FULL text (no truncation) for keyword matching
     """
-    resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    # All postContent divs — pick the one with the most text (the Overview block)
+    soup = BeautifulSoup(html, "lxml")
     content_divs = soup.find_all("div", class_="postContent")
     if not content_divs:
         return None
 
+    # Primary: heading-based identification
+    for div in content_divs:
+        h2 = div.find("h2")
+        if h2 and "overview" in h2.get_text(strip=True).lower():
+            text = div.get_text(" ", strip=True)
+            # Strip the heading text itself from the start
+            heading_text = h2.get_text(strip=True)
+            if text.startswith(heading_text):
+                text = text[len(heading_text):].strip()
+            return text if text else None
+
+    # Fallback: longest block heuristic
+    logger.warning("[undp] Overview heading not found — using longest postContent block (fallback)")
     best = max(content_divs, key=lambda d: len(d.get_text()))
     text = best.get_text(" ", strip=True)
-    return text[:_DESCRIPTION_MAX_CHARS] if text else None
+    return text if text else None
 
 
 class UNDPAdapter(BasePortalAdapter):
-    """Adapter for the UNDP Procurement Notices portal.
+    """Adapter for UNDP Procurement Notices.
 
-    The portal serves all notices in a single HTML page (no server-side search).
-    We fetch the page once, parse all 500+ cards, filter by LATAM region class
-    and then apply KeywordFilter for sector relevance.
+    Fetches the listing page, filters to LATAM, skips expired records,
+    then fetches detail pages concurrently (bounded semaphore) to extract
+    real Overview descriptions for keyword matching.
     """
 
     portal_name = "undp"
 
     def is_available(self) -> bool:
-        """Return True if the portal responds with HTTP 200."""
         try:
+            import requests
             resp = requests.get(BASE_URL, timeout=10)
             return resp.status_code == 200
         except Exception as exc:
@@ -109,121 +148,214 @@ class UNDPAdapter(BasePortalAdapter):
             return False
 
     async def fetch_opportunities(self) -> list[dict]:
-        """Fetch and parse UNDP procurement notices.
-
-        Strategy:
-        1. GET the main page (all notices are server-rendered in one HTML response).
-        2. Parse all <a class="vacanciesTable__row"> cards.
-        3. Filter to LATAM cards using the region_RLA CSS class.
-        4. Fall back to all cards if LATAM yields 0 results.
-        5. Apply KeywordFilter for sector relevance.
-        6. Return up to config.max_results matches.
-        """
+        """Fetch UNDP notices with bounded concurrency and deadline-preserving timeout."""
         if not getattr(self.config, "undp_enabled", True):
             print("[UNDP] Adapter disabled — skipping")
             return []
+        return await self._run()
 
+    async def _run(self) -> list[dict]:
+        """Core logic with explicit task management for timeout preservation."""
         url = f"{BASE_URL}/"
-        print(f"[UNDP] Requesting: {url}")
+        print(f"[UNDP] Requesting listing: {url}")
 
-        try:
-            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            print(f"[UNDP] HTTP status: {resp.status_code}")
-            print(f"[UNDP] Response size: {len(resp.text)} chars")
-            print(f"[UNDP] First 300 chars: {repr(resp.text[:300])}")
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            self._log_error(exc, detail="HTTP request failed")
-            print(f"[UNDP] ERROR: request failed — {exc}")
-            return []
+        # One shared client for the entire adapter run
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_DETAIL_REQUEST_TIMEOUT, connect=10),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            # Fetch listing page
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                self._log_error(exc, detail="listing page fetch failed")
+                print(f"[UNDP] ERROR: listing fetch failed — {exc}")
+                return []
 
-        soup = BeautifulSoup(resp.text, "lxml")
+            print(f"[UNDP] Listing size: {len(resp.text)} chars")
+            soup = BeautifulSoup(resp.text, "lxml")
 
-        # Locate the vacanciesTable container
-        table = soup.find("div", class_="vacanciesTable")
-        if not table:
-            print("[UNDP] ERROR: div.vacanciesTable not found in page")
-            return []
+            table = soup.find("div", class_="vacanciesTable")
+            if not table:
+                print("[UNDP] ERROR: div.vacanciesTable not found")
+                return []
 
-        all_cards = table.find_all("a", class_="vacanciesTable__row")
-        print(f"[UNDP] Raw cards found (all regions): {len(all_cards)}")
+            all_cards = table.find_all("a", class_="vacanciesTable__row")
+            latam_cards = [c for c in all_cards if _LATAM_REGION_CLASS in (c.get("class") or [])]
+            cards_to_parse = latam_cards if latam_cards else all_cards
+            print(f"[UNDP] Total: {len(all_cards)} | LATAM: {len(latam_cards)} | Parsing: {len(cards_to_parse)}")
 
-        # Filter to LATAM region first
-        latam_cards = [c for c in all_cards if _LATAM_REGION_CLASS in (c.get("class") or [])]
-        print(f"[UNDP] LATAM cards (region_RLA): {len(latam_cards)}")
+            # Parse basic card info
+            parsed_cards = [self._parse_card(c) for c in cards_to_parse]
+            parsed_cards = [o for o in parsed_cards if o]
 
-        # Use LATAM subset if available, otherwise fall back to all cards
-        cards_to_parse = latam_cards if latam_cards else all_cards
-        print(f"[UNDP] Cards to parse: {len(cards_to_parse)}")
+            # Skip expired BEFORE detail fetches
+            today = date.today()
+            active_cards: list[dict] = []
+            expired_count = 0
+            for opp in parsed_cards:
+                dl = opp.get("deadline")
+                if dl:
+                    try:
+                        if date.fromisoformat(dl) < today:
+                            expired_count += 1
+                            continue
+                    except ValueError:
+                        pass
+                active_cards.append(opp)
 
-        # Parse cards into opportunity dicts, fetching detail page descriptions
-        raw_results: list[dict] = []
-        detail_fetched = 0
-        detail_fallback = 0
-        for card in cards_to_parse:
-            opp = self._parse_card(card)
-            if not opp:
-                continue
+            if expired_count:
+                print(f"[UNDP] Skipped {expired_count} expired before detail fetch")
+            print(f"[UNDP] Active cards to enrich: {len(active_cards)}")
 
-            # Fetch description from the detail page
-            detail_url = opp.get("opportunity_link", "")
-            if detail_url and detail_url != BASE_URL:
-                try:
-                    description = _fetch_detail_description(detail_url)
-                    if description:
-                        opp["description_snippet"] = description
-                        detail_fetched += 1
-                    else:
-                        # Page loaded but no content found — keep title as fallback
-                        detail_fallback += 1
-                except Exception as exc:
-                    logger.warning("[undp] Detail page fetch failed for %s: %s", detail_url, exc)
-                    detail_fallback += 1
-                    # description_snippet already set to title in _parse_card — leave as-is
+            # Bounded-concurrency detail enrichment with explicit deadline
+            semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DETAIL_FETCHES)
+            deadline = asyncio.get_event_loop().time() + _DETAIL_ENRICHMENT_DEADLINE
 
-            raw_results.append(opp)
+            async def enrich_one(opp: dict) -> bool:
+                """Enrich one opportunity. Returns True if detail fetched successfully."""
+                detail_url = opp.get("opportunity_link", "")
+                if not detail_url or detail_url == BASE_URL:
+                    return False
+                # Semaphore is acquired per-attempt inside _fetch_detail_with_retry
+                overview = await self._fetch_detail_with_retry(
+                    client, detail_url, semaphore, deadline=deadline
+                )
+                if overview:
+                    opp[MATCHING_TEXT_KEY] = overview
+                    opp["description_snippet"] = overview[:_DESCRIPTION_DISPLAY_MAX]
+                    return True
+                return False
 
-        print(f"[UNDP] Successfully parsed: {len(raw_results)} records "
-              f"(detail fetched: {detail_fetched}, fallback to title: {detail_fallback})")
+            # Create tasks and wait with timeout
+            tasks = [asyncio.create_task(enrich_one(opp)) for opp in active_cards]
 
-        # Filter out expired deadlines
-        today = date.today()
-        active, expired = [], []
-        for opp in raw_results:
-            dl = opp.get("deadline")
-            if dl:
-                try:
-                    if date.fromisoformat(dl) < today:
-                        expired.append(opp)
-                        continue
-                except ValueError:
-                    pass
-            active.append(opp)
-        if expired:
-            print(f"[UNDP] Skipped {len(expired)} expired records")
-        raw_results = active
+            # Wait for all tasks but respect the adapter deadline
+            remaining_time = max(0, deadline - asyncio.get_event_loop().time())
+            done, pending = await asyncio.wait(tasks, timeout=remaining_time)
 
-        # Apply keyword filter — now accent-insensitive and Spanish-aware
+            # Cancel and await pending tasks cleanly
+            cancelled_count = 0
+            for task in pending:
+                task.cancel()
+                cancelled_count += 1
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            # Count results
+            detail_fetched = sum(1 for t in done if not t.cancelled() and t.result())
+            detail_fallback = len(active_cards) - detail_fetched
+
+            if cancelled_count:
+                logger.warning(
+                    "[undp] Adapter deadline reached: total=%d, completed=%d, "
+                    "fallback=%d, cancelled=%d — run incomplete",
+                    len(active_cards), detail_fetched,
+                    detail_fallback - cancelled_count, cancelled_count,
+                )
+                print(f"[UNDP] WARN: deadline reached — {cancelled_count} tasks cancelled, "
+                      f"{detail_fetched} completed")
+            else:
+                print(f"[UNDP] Detail pages: fetched={detail_fetched}, fallback={detail_fallback}")
+
+        # Apply keyword filter — uses _matching_text when present (no mutation needed)
         keyword_filter = KeywordFilter(self.config)
-        filtered = [opp for opp in raw_results if keyword_filter.passes_filter(opp)]
-        print(f"[UNDP] Passed keyword filter: {len(filtered)}")
+        filtered: list[dict] = []
+        for opp in active_cards:
+            if keyword_filter.passes_filter(opp):
+                filtered.append(opp)
 
+        print(f"[UNDP] Passed keyword filter: {len(filtered)}")
         if filtered:
-            print(f"[UNDP] Sample match: {filtered[0].get('opportunity_title', '')[:80]}")
+            print(f"[UNDP] Sample: {filtered[0].get('opportunity_title', '')[:70]}")
 
         return filtered[: self.config.max_results]
 
-    def _parse_card(self, card: BeautifulSoup) -> Optional[dict]:
-        """Parse a single <a class='vacanciesTable__row'> into an Opportunity_Dict."""
+    async def _fetch_detail_with_retry(
+        self, client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore,
+        deadline: float = 0,
+    ) -> Optional[str]:
+        """Fetch a detail page with bounded retry for transient failures.
+
+        The semaphore is acquired/released per individual network attempt so that
+        backoff sleeping does not hold a concurrency permit.
+
+        Retry-After is supported in both delay-seconds and HTTP-date formats,
+        clamped to the remaining enrichment deadline.
+
+        Returns the extracted Overview text or None on permanent/exhausted failure.
+        """
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            remaining = max(0, deadline - asyncio.get_event_loop().time()) if deadline else 999
+            if remaining <= 0:
+                logger.warning("[undp] Deadline expired before attempt %d for %s", attempt, url)
+                return None
+
+            try:
+                # Acquire semaphore only around the actual network call
+                async with semaphore:
+                    resp = await client.get(url)
+
+                # Permanent failure — do not retry
+                if resp.status_code in _PERMANENT_FAIL_STATUS_CODES:
+                    logger.warning(
+                        "[undp] Permanent %d for %s — no retry", resp.status_code, url
+                    )
+                    return None
+
+                # Retryable status — release permit before sleeping
+                if resp.status_code in _RETRYABLE_STATUS_CODES:
+                    if attempt < _MAX_ATTEMPTS:
+                        retry_after = resp.headers.get("Retry-After", "")
+                        wait = _parse_retry_after(retry_after, remaining)
+                        if wait <= 0:
+                            wait = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                            wait = min(wait, remaining)
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.warning(
+                        "[undp] Exhausted %d attempts for %s (last status=%d)",
+                        _MAX_ATTEMPTS, url, resp.status_code,
+                    )
+                    return None
+
+                resp.raise_for_status()
+                return _extract_overview_from_detail(resp.text)
+
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                if attempt < _MAX_ATTEMPTS:
+                    backoff = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                    backoff = min(backoff, remaining)
+                    logger.info(
+                        "[undp] Transient error for %s (attempt %d/%d): %s — retrying in %.1fs",
+                        url, attempt, _MAX_ATTEMPTS, exc, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(
+                        "[undp] Exhausted %d attempts for %s: %s",
+                        _MAX_ATTEMPTS, url, exc,
+                    )
+                    return None
+            except httpx.HTTPStatusError as exc:
+                logger.warning("[undp] HTTP error for %s: %s", url, exc)
+                return None
+            except Exception as exc:
+                logger.warning("[undp] Unexpected error for %s: %s", url, exc)
+                return None
+
+        return None
+
+    def _parse_card(self, card) -> Optional[dict]:
+        """Parse a single listing-page card into a basic Opportunity_Dict."""
         try:
             title = _extract_cell(card, "Title")
             ref_no = _extract_cell(card, "Ref No")
             country_raw = _extract_cell(card, "UNDP Office/Country")
             process = _extract_cell(card, "Process")
             deadline_raw = _extract_cell(card, "Deadline")
-            posted_raw = _extract_cell(card, "Posted")
 
-            # Normalise country: "UNOPS/GABON" → "Gabon", "UNDP-COL/COLOMBIA" → "Colombia"
             country_region = None
             if country_raw:
                 if "/" in country_raw:
@@ -231,21 +363,14 @@ class UNDPAdapter(BasePortalAdapter):
                 else:
                     country_region = country_raw.strip().title()
 
-            # Build opportunity_id
             if ref_no:
                 opportunity_id = f"undp-{ref_no}"
             else:
                 hash_src = (title or "") + (country_raw or "")
                 opportunity_id = "undp-" + hashlib.sha256(hash_src.encode()).hexdigest()[:12]
 
-            # Build full link
             href = card.get("href", "")
-            if href:
-                link = urljoin(f"{BASE_URL}/", href)
-            else:
-                link = BASE_URL
-
-            deadline = _parse_deadline(deadline_raw)
+            link = urljoin(f"{BASE_URL}/", href) if href else BASE_URL
 
             return {
                 "opportunity_id": opportunity_id,
@@ -253,17 +378,13 @@ class UNDPAdapter(BasePortalAdapter):
                 "devex_opportunity_id": opportunity_id,
                 "funder_organisation": "UNDP",
                 "country_region": country_region,
-                "deadline": deadline,
+                "deadline": _parse_deadline(deadline_raw),
                 "contract_value": None,
                 "opportunity_link": link,
-                # description_snippet is intentionally set to title here as a safe
-                # default; fetch_opportunities() will overwrite it with the real
-                # description fetched from the detail page.
-                "description_snippet": title,
+                "description_snippet": title,  # default fallback; enriched later
                 "source_portal": "undp",
                 "portal_source": "UNDP",
                 "notice_type": process,
-                "publication_date": posted_raw,
                 "matched_keywords": [],
             }
         except Exception as exc:
