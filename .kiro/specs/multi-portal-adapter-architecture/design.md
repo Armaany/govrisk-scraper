@@ -88,7 +88,7 @@ flowchart TD
 | `config.py` | Add `devex_enabled`, `samgov_api_key`, `samgov_enabled`, `perplexity_api_key`, `perplexity_enabled` fields + validation |
 | `models.py` | Add `source_portal: str` field to `OpportunityRecord`; make `to_dict()` a canonical round-trippable serializer (all internal field names, no `portal_source`); update `from_dict()` |
 | `main.py` | Replace single-portal pipeline with adapter registry loop; seed cross-run dedup from `store.get_all_links()` keyed on `opportunity_link` |
-| `store/adapter_sheets.py` | Keep the existing 12-column `HEADERS` (Live_Sheet_Schema) unchanged; update `write_record()` to project the canonical dict onto the 12 external columns (`source_portal` → `portal_source` at column 1); add `get_all_links()`; deprecate `get_records_since()` |
+| `store/adapter_sheets.py` | Schema v1.1: 14-column `HEADERS` (Live_Sheet_Schema v1.1 — original 12 + `scraped_at` + `matched_keywords`); header-name-driven writer projects values by normalized name not index; `source_portal` → `portal_source`; `scraped_at` serialized as UTC ISO 8601 with Z suffix; `matched_keywords` as UTF-8 JSON array; add `get_all_links()`; `get_records_since()` intentionally unsupported for this demo |
 | `store/adapter_airtable.py` | `write_record()` passes canonical `to_dict()` (including `source_portal`) through; update `get_records_since()` default handling |
 
 ### Unchanged files
@@ -773,18 +773,19 @@ Guarantees:
 
 ### SheetsAdapter (`store/adapter_sheets.py`)
 
-Under Option A the live Google Sheet uses a **fixed, authoritative 12-column schema**
-(`Live_Sheet_Schema`) that predates this feature and is **not migrated**. `HEADERS` therefore
-stays **exactly as it is** — `source_portal` is **not** appended:
+Schema v1.1 extends the contract to **14 required columns** by appending `scraped_at` and
+`matched_keywords` to the original 12. Writing is **header-name-driven**: values are projected
+by normalized column name, not positional index. Required headers may appear in any order.
+(Historical: the v1.0 schema was 12 columns with positional writing, now superseded.)
 
 ```python
-# UNCHANGED — the frozen 12-column Live_Sheet_Schema
+# Schema v1.1 — 14-column Live_Sheet_Schema
 HEADERS = [
     "portal_source",       # col 1  — external label for canonical source_portal
     "opportunity_title",   # col 2
     "funder_organisation", # col 3
     "country_region",      # col 4
-    "deadline",            # col 5
+    "deadline",            # col 5  — opportunity submission deadline
     "contract_value",      # col 6
     "opportunity_link",    # col 7  — persisted link, used for cross-run dedup
     "summary",             # col 8
@@ -792,12 +793,17 @@ HEADERS = [
     "bid_recommendation",  # col 10
     "risk_flags",          # col 11
     "review_status",       # col 12
+    "scraped_at",          # col 13 — UTC discovery timestamp (ISO 8601 with Z)
+    "matched_keywords",    # col 14 — authoritative JSON array from Tool 1
 ]
 ```
 
-There is **no** `devex_opportunity_id` column and **no** `scraped_at` column in the live sheet.
+`scraped_at` = discovery timestamp (when Tool 1 scraped the opportunity), distinct from
+`deadline` = opportunity submission deadline. `matched_keywords` = the authoritative
+per-opportunity keyword list; Tool 2 displays it without recomputation. Historical rows
+may have blank `scraped_at`/`matched_keywords` values; this is valid.
 
-#### `write_record()` — presentation mapping (canonical → 12 external columns)
+#### `write_record()` — header-name-driven projection (canonical → external columns)
 
 `to_dict()` now returns the **canonical** dict keyed by internal field names. Because the
 external sheet uses `portal_source` (not the internal `source_portal`) and exposes only 12 of the
@@ -856,15 +862,15 @@ def get_all_links(self) -> set[str]:
     return {value.strip() for value in link_column[1:] if value.strip()}
 ```
 
-#### `get_records_since()` — unsupported/deprecated under the 12-column schema
+#### `get_records_since()` — intentionally unsupported for this demo
 
-The Live_Sheet_Schema has **no `scraped_at` column**, so time-based retrieval cannot be
-supported. `get_records_since()` is deprecated and, matching the selected implementation,
-raises `NotImplementedError` (Req 9.6):
+Although `scraped_at` is now persisted in schema v1.1, `get_records_since()` remains
+intentionally unsupported for the Opportunity Monitor demo. Tool 2 will read rows by
+header name and perform its own grouping/filtering. Raises `NotImplementedError` (Req 9.6):
 
 ```python
 def get_records_since(self, since: datetime) -> list:
-    """Unsupported under the Live_Sheet_Schema: there is no scraped_at column.
+    """Unsupported for this demo. Tool 2 reads rows by header name.
     Raises NotImplementedError by contract (Req 9.6); use get_all_links() for
     cross-run deduplication."""
     raise NotImplementedError(
@@ -873,25 +879,25 @@ def get_records_since(self, since: datetime) -> list:
     )
 ```
 
-#### Startup header validation (schema v1.0)
+#### Startup header validation (schema v1.1)
 
-`_ensure_headers()` enforces the frozen schema on initialization, before any
+`_ensure_headers()` enforces the required schema on initialization, before any
 read or write:
 
-- If the sheet is empty, it writes the canonical 12-column header.
-- If row 1 is populated, `_validate_headers()` checks it against `HEADERS` and
-  raises `SheetsSchemaError` on any missing, duplicate (including duplicates
-  that differ only by surrounding whitespace or letter case), reordered, or
-  unexpected header. Because header-order-independent writing is deferred to
-  Phase B, reordered/unexpected headers are rejected under v1.0 to avoid
-  positional corruption. A populated header is never rewritten or auto-repaired.
+- If the sheet is empty, it writes the canonical 14-column header in canonical order.
+- If row 1 is populated, `_validate_headers()` checks that all 14 required columns
+  are present (in any order), rejects duplicates (including whitespace/case-normalized
+  duplicates), and raises `SheetsSchemaError` on missing required columns. Unknown
+  additional columns are accepted (blanks written under them). A populated header is
+  never rewritten automatically. A legacy 12-column header produces an explicit
+  migration error naming the missing columns (`scraped_at`, `matched_keywords`).
 
 #### Deprecated ID-based lookups
 
-`get_all_ids()` and `record_exists()` raise `NotImplementedError`: the frozen
-12-column schema has no persisted opportunity-ID column (column 1 is
-`portal_source`). Cross-run deduplication uses `get_all_links()` instead. The
-Airtable equivalents remain functional because Airtable persists
+`get_all_ids()` and `record_exists()` raise `NotImplementedError`: the schema
+has no persisted opportunity-ID column (column 1 is `portal_source`). Cross-run
+deduplication uses `get_all_links()` instead. The Airtable equivalents remain
+functional because Airtable persists
 `devex_opportunity_id`.
 
 ### AirtableAdapter (`store/adapter_airtable.py`)

@@ -232,6 +232,20 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
 - The per-adapter `try/except Exception` in the orchestrator loop is a hard requirement — see design Error Handling section
 - `_is_latam_relevant()` in `SAMGovAdapter` is required because SAM.gov returns global results
 
+## Schema v1.1 — Discovery Metadata Extension
+
+- [x] 14. Extend Live_Sheet_Schema from 12 to 14 columns (append `scraped_at`, `matched_keywords`)
+  - Header-name-driven writer binds values by normalized column name, not position
+  - Accept any column order; reject missing required or duplicate columns
+  - Unknown additional columns written as blank
+  - Populated header rows never automatically rewritten
+  - `scraped_at` = UTC discovery timestamp, ISO 8601 with Z suffix; naive datetimes rejected
+  - `matched_keywords` = authoritative UTF-8 JSON array; Tool 2 displays without recomputation
+  - Empty matches serialize as `[]`; historical blank values valid
+  - Legacy 12-column header produces explicit migration error
+  - _Code and tests: complete on `feature/sheet-schema-v1.1` (116 tests pass, 3 known stubs)_
+  - _Live Google Sheet migration: **pending — not authorized**_
+
 ## Requirement 11 — Additional requirement traceability (documented, not directly verified)
 
 The following Requirement 11 clauses are implemented and documented in `design.md`
