@@ -10,7 +10,7 @@
 - Requirement 6.6: the source_portal value is threaded through OpportunityRecord so it persists
   (i.e. it survives a to_dict() -> from_dict() round-trip) for arbitrary portal values.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -97,7 +97,8 @@ def _records(draw):
             st.datetimes(
                 min_value=datetime(2000, 1, 1),
                 max_value=datetime(2100, 1, 1),
-            )
+                timezones=st.just(timezone.utc),
+            ).map(lambda dt: dt.replace(microsecond=0))
         ),
         source_portal=draw(_source_portal),
     )

@@ -84,15 +84,17 @@ SOURCE_PORTAL_VALUES = st.one_of(
 @settings(max_examples=100)
 def test_property_14_write_record_maps_source_portal_to_portal_source_column(source_portal):
     """Property 14: write_record projects canonical source_portal onto the
-    external portal_source column (column 1) of the frozen 12-column schema.
+    external portal_source column of the 14-column schema v1.1.
 
     **Validates: Requirements 9.3, 9.4**
     """
     adapter = _make_adapter()
+    adapter._header_index = {h: i for i, h in enumerate(SheetsAdapter.HEADERS)}
+    adapter._row_length = len(SheetsAdapter.HEADERS)
     record = _make_record(source_portal)
 
     assert "source_portal" not in SheetsAdapter.HEADERS
-    assert len(SheetsAdapter.HEADERS) == 12
+    assert len(SheetsAdapter.HEADERS) == 14
 
     written_rows = []
     adapter.worksheet.append_row.side_effect = lambda row, **kwargs: written_rows.append(row)
@@ -102,7 +104,7 @@ def test_property_14_write_record_maps_source_portal_to_portal_source_column(sou
 
     assert len(written_rows) == 1, "append_row should be called exactly once"
     written_row = written_rows[0]
-    assert len(written_row) == 12
+    assert len(written_row) == 14
 
     expected_index = SheetsAdapter.HEADERS.index("portal_source")
     assert expected_index == 0
@@ -179,29 +181,27 @@ def test_duplicate_after_trim_and_case_rejected():
         adapter._validate_headers(bad)
 
 
-def test_reordered_header_rejected():
-    """A reordered header (same set, different order) is rejected under v1.0."""
+def test_reordered_header_accepted():
+    """A reordered header (same set, different order) is accepted under v1.1."""
     adapter = _make_adapter()
-    bad = list(SheetsAdapter.HEADERS)
-    bad[0], bad[1] = bad[1], bad[0]  # swap first two columns
-    with pytest.raises(SheetsSchemaError):
-        adapter._validate_headers(bad)
+    reordered = list(SheetsAdapter.HEADERS)
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    adapter._validate_headers(reordered)  # must not raise
 
 
-def test_unexpected_extra_header_rejected():
-    """An unexpected extra column is rejected."""
+def test_unexpected_extra_header_preserved():
+    """Extra unknown columns are allowed under v1.1 (blanks written under them)."""
     adapter = _make_adapter()
-    bad = list(SheetsAdapter.HEADERS) + ["extra_column"]
-    with pytest.raises(SheetsSchemaError):
-        adapter._validate_headers(bad)
+    extended = list(SheetsAdapter.HEADERS) + ["extra_column"]
+    adapter._validate_headers(extended)  # must not raise
 
 
 def test_validation_runs_before_any_write_on_populated_bad_header():
-    """When row 1 is populated but invalid, _ensure_headers raises and never
-    attempts to write/repair the header."""
+    """When row 1 is populated but has a missing required column, _ensure_headers
+    raises and never attempts to write/repair the header."""
     adapter = _make_adapter()
     bad = list(SheetsAdapter.HEADERS)
-    bad[0], bad[1] = bad[1], bad[0]  # reordered -> invalid
+    bad.remove("scraped_at")  # missing required column
     adapter.worksheet.row_values.return_value = bad
 
     with pytest.raises(SheetsSchemaError):

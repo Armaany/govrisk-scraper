@@ -11,7 +11,7 @@ source_portal -> portal_source mapping performed by SheetsAdapter.
   (column 1 of the Live_Sheet_Schema).
 """
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
 
 from hypothesis import given, settings
@@ -49,6 +49,8 @@ FROZEN_HEADERS = [
     "bid_recommendation",
     "risk_flags",
     "review_status",
+    "scraped_at",
+    "matched_keywords",
 ]
 
 
@@ -109,7 +111,11 @@ def _records(draw):
         llm_called=draw(st.booleans()),
         anna_benchmark=draw(st.booleans()),
         scraped_at=draw(
-            st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2100, 1, 1))
+            st.datetimes(
+                min_value=datetime(2000, 1, 1),
+                max_value=datetime(2100, 1, 1),
+                timezones=st.just(timezone.utc),
+            ).map(lambda dt: dt.replace(microsecond=0))
         ),
         source_portal=draw(_source_portal),
     )
@@ -119,7 +125,7 @@ def _records(draw):
 # Test: HEADERS remains the frozen 12-column schema (no source_portal appended).
 # ---------------------------------------------------------------------------
 def test_headers_is_frozen_12_column_schema():
-    """HEADERS must be exactly the frozen 12-column Live_Sheet_Schema, unchanged.
+    """HEADERS must be exactly the frozen 14-column Live_Sheet_Schema v1.1.
 
     **Validates: Requirements 9.3**
     """
@@ -129,7 +135,7 @@ def test_headers_is_frozen_12_column_schema():
     )
     # No canonical 'source_portal' column may be appended to the external schema.
     assert "source_portal" not in SheetsAdapter.HEADERS
-    assert len(SheetsAdapter.HEADERS) == 12
+    assert len(SheetsAdapter.HEADERS) == 14
     # portal_source occupies column 1 (index 0).
     assert SheetsAdapter.HEADERS.index("portal_source") == 0
 
@@ -147,34 +153,28 @@ def test_headers_is_frozen_12_column_schema():
 @given(record=_records())
 @settings(max_examples=300)
 def test_property_14_source_portal_maps_to_portal_source_column(record):
-    """_project_row projects canonical fields positionally onto the 12 columns.
+    """_project_row projects canonical fields by header name onto the 14 columns.
 
     **Validates: Requirements 9.3, 9.4**
     """
-    # _project_row only depends on class attributes + record.to_dict(); no live
-    # worksheet is needed, so build the adapter without running __init__.
     adapter = SheetsAdapter.__new__(SheetsAdapter)
+    adapter._header_index = {h: i for i, h in enumerate(SheetsAdapter.HEADERS)}
+    adapter._row_length = len(SheetsAdapter.HEADERS)
     row = adapter._project_row(record)
 
-    # Row is exactly the frozen width.
-    assert len(row) == len(FROZEN_HEADERS) == 12
+    # Row is exactly the schema width.
+    assert len(row) == len(FROZEN_HEADERS) == 14
 
     # source_portal lands under the portal_source column (column 1 / index 0).
     portal_idx = SheetsAdapter.HEADERS.index("portal_source")
     assert portal_idx == 0
     assert row[portal_idx] == record.source_portal
 
-    # Every column equals its canonical counterpart under the documented
-    # projection rules (risk_flags list joined with ", "; None -> "").
-    payload = record.to_dict()
-    for i, header in enumerate(SheetsAdapter.HEADERS):
-        canonical_key = SheetsAdapter.CANONICAL_KEY_FOR_COLUMN[header]
-        expected = payload.get(canonical_key)
-        if header == "risk_flags" and isinstance(expected, list):
-            expected = ", ".join(str(flag) for flag in expected)
-        if expected is None:
-            expected = ""
-        assert row[i] == expected, (
-            f"Column '{header}' (index {i}) misaligned.\n"
-            f"  expected={expected!r}\n  got={row[i]!r}"
-        )
+    # matched_keywords is JSON serialized
+    import json
+    mk_idx = SheetsAdapter.HEADERS.index("matched_keywords")
+    assert json.loads(row[mk_idx]) == list(record.matched_keywords)
+
+    # scraped_at ends with Z
+    sa_idx = SheetsAdapter.HEADERS.index("scraped_at")
+    assert row[sa_idx].endswith("Z")

@@ -1,4 +1,6 @@
 # Google Sheets adapter for appending and querying opportunity records.
+# Schema v1.1: 14-column canonical schema with header-name-driven writing.
+import json
 from datetime import datetime
 
 import gspread
@@ -13,16 +15,21 @@ class StoreWriteError(Exception):
 
 
 class SheetsSchemaError(Exception):
-    """Raised when the Google Sheet header row does not match the canonical
-    12-column Live_Sheet_Schema (missing, duplicate, reordered, or unexpected
-    headers). Schema v1.0 (Option A) rejects any deviation to prevent
-    positional corruption; header-order-independent writing is deferred to
-    Phase B."""
+    """Raised when the Google Sheet header row does not match the required
+    schema. Schema v1.1 requires all 14 canonical columns to be present
+    (in any order), rejects duplicates (including whitespace/case-normalized),
+    and rejects missing required columns before any write."""
 
 
 class SheetsAdapter:
-    """Provides append and lookup operations for Google Sheets storage."""
+    """Provides append and lookup operations for Google Sheets storage.
 
+    Schema v1.1 extends the frozen contract from 12 to 14 columns by appending
+    ``scraped_at`` and ``matched_keywords``.  Writing is header-name-driven:
+    values are projected by normalized column name, not by positional index.
+    """
+
+    # Canonical 14-column schema v1.1 — initialization order.
     HEADERS = [
         "portal_source",
         "opportunity_title",
@@ -35,16 +42,12 @@ class SheetsAdapter:
         "relevance_score",
         "bid_recommendation",
         "risk_flags",
-        "review_status"
+        "review_status",
+        "scraped_at",
+        "matched_keywords",
     ]
 
-    # Explicit projection from each external Live_Sheet_Schema column (HEADERS)
-    # onto its canonical source key emitted by ``OpportunityRecord.to_dict()``.
-    # The canonical model uses the internal name ``source_portal``; the external
-    # column-1 label is ``portal_source`` — this mapping bridges the two.
-    # Canonical fields with no external column (devex_opportunity_id,
-    # description_snippet, matched_keywords, relevance_reason, llm_confidence,
-    # llm_called, anna_benchmark, scraped_at) are intentionally NOT projected.
+    # Mapping from external column name → canonical internal dict key.
     CANONICAL_KEY_FOR_COLUMN = {
         "portal_source": "source_portal",
         "opportunity_title": "opportunity_title",
@@ -58,6 +61,8 @@ class SheetsAdapter:
         "bid_recommendation": "bid_recommendation",
         "risk_flags": "risk_flags",
         "review_status": "review_status",
+        "scraped_at": "scraped_at",
+        "matched_keywords": "matched_keywords",
     }
 
     def __init__(self, config: Config):
@@ -79,13 +84,10 @@ class SheetsAdapter:
     def clear_and_reset(self) -> None:
         """Delete all data rows, keeping header row 1 intact."""
         try:
-            total_rows = self.worksheet.row_count
             data_rows = self.worksheet.get_all_values()
-            # Only clear if there are data rows beyond the header
             if len(data_rows) <= 1:
                 print("[Sheets] Sheet already empty — nothing to clear")
                 return
-            # Delete rows from bottom up to avoid index shifting (rows 2 onward)
             num_data_rows = len(data_rows) - 1
             self.worksheet.delete_rows(2, len(data_rows))
             print(f"[Sheets] Sheet cleared — {num_data_rows} data rows removed, header kept")
@@ -106,35 +108,44 @@ class SheetsAdapter:
             return False
 
     def _ensure_headers(self) -> None:
-        """Initialize or strictly validate the header row (schema v1.0, Option A).
+        """Initialize or validate the header row (schema v1.1).
 
-        - If the sheet is empty, write the canonical 12-column header.
-        - If row 1 is populated, validate it BEFORE any read or write. Reject
-          missing, duplicate (including duplicates that differ only by
-          surrounding whitespace or letter case), reordered, or unexpected
-          headers by raising :class:`SheetsSchemaError`.
-        - Never rewrite or repair a populated live header automatically.
+        - If the sheet is empty, write the canonical 14-column header.
+        - If row 1 is populated, validate it. Reject missing required columns,
+          duplicates, etc. Accept any column order.
+        - Never rewrite a populated header row.
         """
         first_row = self.worksheet.row_values(1)
         if not any((cell or "").strip() for cell in first_row):
             self.worksheet.append_row(self.HEADERS, value_input_option="RAW")
+            self._header_index = {h: i for i, h in enumerate(self.HEADERS)}
+            self._row_length = len(self.HEADERS)
             return
         self._validate_headers(first_row)
 
     def _validate_headers(self, header_row: list) -> None:
-        """Strictly validate a populated header row against the canonical schema."""
+        """Validate a populated header row against v1.1 required columns.
+
+        Rules:
+        - All 14 canonical columns must be present (any order).
+        - No duplicates after trim + casefold normalization.
+        - Unknown additional columns are allowed (blanks written under them).
+        - A legacy 12-column header missing scraped_at/matched_keywords
+          produces an explicit migration error.
+        """
         raw = [(h if h is not None else "") for h in header_row]
-        # Drop trailing fully-empty padding cells that Sheets may append.
+        # Drop trailing fully-empty padding cells.
         trimmed = list(raw)
         while trimmed and not trimmed[-1].strip():
             trimmed.pop()
 
-        # Duplicate detection normalized by trim + casefold (catches dups that
-        # differ only by whitespace or letter case).
-        seen = {}
-        duplicates = []
+        # Duplicate detection (case/whitespace normalized).
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
         for original in trimmed:
             norm = original.strip().casefold()
+            if not norm:
+                continue
             if norm in seen:
                 duplicates.append(original)
             else:
@@ -146,77 +157,75 @@ class SheetsAdapter:
                 f"Expected the canonical schema: {self.HEADERS}"
             )
 
-        expected = self.HEADERS
-        expected_set = set(expected)
-        actual_set = set(trimmed)
-        missing = [h for h in expected if h not in actual_set]
-        unexpected = [h for h in trimmed if h not in expected_set]
-        if missing or unexpected:
+        # Check required columns present.
+        actual_normed = {h.strip().casefold(): h.strip() for h in trimmed if h.strip()}
+        required_set = set(self.HEADERS)
+        missing = [h for h in self.HEADERS if h.casefold() not in actual_normed]
+
+        if missing:
+            # Produce explicit v1.0 → v1.1 migration error for 12-col sheets.
             raise SheetsSchemaError(
-                "Google Sheet header does not match the canonical schema. "
-                f"missing={missing} unexpected={unexpected}. "
-                f"Expected exactly (in order): {expected}"
+                f"schema incompatible — missing columns: {', '.join(missing)}. "
+                f"The v1.1 schema requires all 14 canonical columns. "
+                f"Current header: {trimmed}"
             )
 
-        # Same set of columns but a different order: rejected under schema v1.0
-        # (order-dependent writing; reordering risks positional corruption).
-        if trimmed != expected:
-            raise SheetsSchemaError(
-                "Google Sheet header is present but reordered. Schema v1.0 "
-                "requires the exact canonical column order. "
-                f"expected={expected} actual={trimmed}"
-            )
+        # Build header index mapping (actual column positions).
+        # Use the original (non-normalized) header values for index lookup.
+        self._header_index = {}
+        for idx, h in enumerate(trimmed):
+            norm = h.strip().casefold()
+            # Map canonical column names to their position.
+            for canonical in self.HEADERS:
+                if canonical.casefold() == norm:
+                    self._header_index[canonical] = idx
+                    break
+        self._row_length = len(trimmed)
 
     def get_all_ids(self) -> set:
-        """Deprecated under the 12-column Live_Sheet_Schema.
-
-        The frozen schema has no persisted opportunity-ID column (column 1 is
-        ``portal_source``), so there is no stable ID to read. Raises immediately
-        (before any worksheet call). Use :meth:`get_all_links` for cross-run
-        deduplication instead.
-        """
+        """Deprecated — raises NotImplementedError."""
         raise NotImplementedError(
-            "SheetsAdapter.get_all_ids() is unsupported under the 12-column "
-            "Live_Sheet_Schema: column 1 is 'portal_source', not an opportunity "
-            "ID. Use get_all_links() for cross-run deduplication."
+            "SheetsAdapter.get_all_ids() is unsupported under the v1.1 schema. "
+            "Use get_all_links() for cross-run deduplication."
         )
 
     def record_exists(self, devex_opportunity_id: str) -> bool:
-        """Deprecated under the 12-column Live_Sheet_Schema (no persisted ID).
-
-        Raises immediately (before any worksheet call). Use
-        :meth:`get_all_links` for cross-run deduplication instead.
-        """
+        """Deprecated — raises NotImplementedError."""
         raise NotImplementedError(
-            "SheetsAdapter.record_exists() is unsupported under the 12-column "
-            "Live_Sheet_Schema: there is no persisted opportunity-ID column. "
+            "SheetsAdapter.record_exists() is unsupported under the v1.1 schema. "
             "Use get_all_links() for cross-run deduplication."
         )
 
     def _project_row(self, record: OpportunityRecord) -> list:
-        """Project a canonical record onto the frozen 12-column Live_Sheet_Schema.
+        """Project a canonical record onto the header-driven row.
 
-        Performs an EXPLICIT ordered projection: for each external column in
-        ``HEADERS`` (in order), pull the value from the canonical
-        ``record.to_dict()`` payload using ``CANONICAL_KEY_FOR_COLUMN``. This
-        keeps writes positionally aligned with the live header row and maps the
-        canonical ``source_portal`` onto the external ``portal_source`` column
-        (column 1). ``risk_flags`` (a canonical list) is joined into a
-        comma-separated string to match prior display behavior. ``None`` values
-        are substituted with ``""`` so the row stays aligned.
+        Values are placed by header name, not index. Unknown columns get blanks.
+        Special handling:
+        - source_portal → portal_source column
+        - risk_flags → comma-separated string
+        - matched_keywords → JSON array (UTF-8 safe, no ASCII escaping)
+        - scraped_at → UTC ISO 8601 with Z suffix
         """
         payload = record.to_dict()
-        row = []
-        for header in self.HEADERS:
-            canonical_key = self.CANONICAL_KEY_FOR_COLUMN[header]
+        row = [""] * self._row_length
+        for header, idx in self._header_index.items():
+            canonical_key = self.CANONICAL_KEY_FOR_COLUMN.get(header)
+            if canonical_key is None:
+                continue
             value = payload.get(canonical_key)
             if header == "risk_flags" and isinstance(value, list):
                 value = ", ".join(str(flag) for flag in value)
-            row.append("" if value is None else value)
+            elif header == "matched_keywords":
+                value = record.serialize_matched_keywords_for_sheet()
+            elif header == "scraped_at":
+                value = payload.get("scraped_at", "")
+            if value is None:
+                value = ""
+            row[idx] = value
         return row
 
     def write_record(self, record: OpportunityRecord) -> str:
-        """Append one record via explicit projection and return written row number."""
+        """Append one record via header-name-driven projection."""
         try:
             row = self._project_row(record)
             self.worksheet.append_row(row, value_input_option="RAW")
@@ -227,13 +236,10 @@ class SheetsAdapter:
     def get_all_links(self) -> set:
         """Return persisted non-empty opportunity_link values for cross-run dedup.
 
-        Reads the ``opportunity_link`` column (its index in ``HEADERS``, i.e.
-        column 7 / index 6) excluding the header row. Uses a defensive
-        try/except — returns an empty set on error. (Note: ``get_all_ids`` is
-        deprecated and raises immediately; it no longer shares this code path.)
+        Reads the opportunity_link column by its actual header position.
         """
         try:
-            link_index = self.HEADERS.index("opportunity_link")
+            link_index = self._header_index["opportunity_link"]
             link_column = self.worksheet.col_values(link_index + 1)
         except Exception:
             return set()
@@ -242,16 +248,11 @@ class SheetsAdapter:
         return {value.strip() for value in link_column[1:] if value.strip()}
 
     def get_records_since(self, since: datetime) -> list:
-        """Unsupported under the Live_Sheet_Schema — always raises.
+        """Unsupported — raises NotImplementedError.
 
-        The authoritative live 12-column schema has no ``scraped_at`` column, so
-        there is no timestamp to filter on. This method therefore cannot be
-        implemented against the live sheet and is deprecated. ``main.py`` does
-        not call it, so raising here is safe. Cross-run deduplication is instead
-        seeded from :meth:`get_all_links`.
+        Cross-run deduplication uses get_all_links() instead.
         """
         raise NotImplementedError(
-            "get_records_since() is not supported under the Live_Sheet_Schema: "
-            "the frozen 12-column Google Sheet has no 'scraped_at' column to "
-            "filter on. Use get_all_links() for cross-run deduplication instead."
+            "get_records_since() is not supported. "
+            "Use get_all_links() for cross-run deduplication."
         )

@@ -1,6 +1,7 @@
 # Dataclasses and enums for normalized opportunity records and serialization.
+import json
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -64,7 +65,7 @@ class OpportunityRecord:
     review_status: ReviewStatus = ReviewStatus.PENDING_REVIEW
     llm_called: bool = False
     anna_benchmark: bool = False
-    scraped_at: datetime = field(default_factory=datetime.now)
+    scraped_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source_portal: str = "devex"
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,9 +105,32 @@ class OpportunityRecord:
             "review_status": self.review_status.value if self.review_status else "pending_review",
             "llm_called": self.llm_called,
             "anna_benchmark": self.anna_benchmark,
-            "scraped_at": self.scraped_at.isoformat(),
+            "scraped_at": self._serialize_scraped_at(),
             "source_portal": self.source_portal,
         }
+
+    def _serialize_scraped_at(self) -> str:
+        """Serialize scraped_at as ISO 8601 with Z suffix (always UTC).
+
+        Naive datetimes are deterministically rejected by raising ValueError
+        to prevent ambiguous local timestamps from being silently labelled UTC.
+        """
+        dt = self.scraped_at
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            raise ValueError(
+                "scraped_at must be timezone-aware (UTC). "
+                f"Got naive datetime: {dt.isoformat()}"
+            )
+        utc_dt = dt.astimezone(timezone.utc)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def serialize_matched_keywords_for_sheet(self) -> str:
+        """Serialize matched_keywords as a JSON array for the Sheet cell.
+
+        Uses ensure_ascii=False so accented Spanish terms survive intact.
+        Empty matches produce '[]'.
+        """
+        return json.dumps(list(self.matched_keywords), ensure_ascii=False)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OpportunityRecord":
@@ -145,6 +169,28 @@ class OpportunityRecord:
             review_status=ReviewStatus(data.get("review_status", ReviewStatus.PENDING_REVIEW.value)),
             llm_called=bool(data.get("llm_called", False)),
             anna_benchmark=bool(data.get("anna_benchmark", False)),
-            scraped_at=datetime.fromisoformat(scraped_at_value) if scraped_at_value else datetime.now(),
+            scraped_at=cls._parse_scraped_at(scraped_at_value),
             source_portal=str(data.get("source_portal", "devex")),
         )
+
+    @classmethod
+    def _parse_scraped_at(cls, value) -> datetime:
+        """Parse scraped_at from string or return UTC now if falsy."""
+        if not value:
+            return datetime.now(timezone.utc)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                raise ValueError(
+                    f"scraped_at must be timezone-aware. Got naive: {value.isoformat()}"
+                )
+            return value
+        # Handle Z suffix
+        s = str(value)
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            raise ValueError(
+                f"scraped_at must be timezone-aware. Got naive string: {value}"
+            )
+        return dt

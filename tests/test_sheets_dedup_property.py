@@ -35,12 +35,16 @@ from store.adapter_sheets import SheetsAdapter  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 def _sheets_adapter_with_link_column(link_column_values):
-    """Build a SheetsAdapter (no __init__) whose worksheet.col_values(7) returns
+    """Build a SheetsAdapter (no __init__) whose worksheet.col_values returns
     the supplied header + link rows list."""
     adapter = SheetsAdapter.__new__(SheetsAdapter)
     ws = MagicMock()
 
-    link_index = SheetsAdapter.HEADERS.index("opportunity_link")  # 6 -> column 7
+    # Set up header index (v1.1 header-name-driven)
+    adapter._header_index = {h: i for i, h in enumerate(SheetsAdapter.HEADERS)}
+    adapter._row_length = len(SheetsAdapter.HEADERS)
+
+    link_index = adapter._header_index["opportunity_link"]
 
     def _col_values(n):
         if n == link_index + 1:

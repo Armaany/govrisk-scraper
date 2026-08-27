@@ -1,6 +1,7 @@
 # Main async orchestrator wiring all scraper components end-to-end.
 import argparse
 import asyncio
+from datetime import datetime, timezone
 
 from config import load_config
 from engine.keyword_filter import KeywordFilter
@@ -177,6 +178,8 @@ async def run_scraper():
             # Strip transient fields before serialization — they must not leak to Sheets
             merged.pop("_matching_text", None)
             merged.pop("_full_overview", None)
+            # Stamp discovery time as UTC (v1.1 schema contract)
+            merged.setdefault("scraped_at", datetime.now(timezone.utc))
             record = OpportunityRecord.from_dict(merged)
 
             if config.run_mode == "live":
