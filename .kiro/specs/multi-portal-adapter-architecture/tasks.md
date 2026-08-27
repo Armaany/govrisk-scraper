@@ -25,15 +25,14 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     - **Property 8: Config credential validation raises on enabled-but-missing key**
     - **Validates: Requirements 5.6, 5.7**
 
-- [x] 2. Add source_portal field to OpportunityRecord
+- [x] 2. Add source_portal field and make to_dict() canonical & round-trippable (Option A)
   - Add `source_portal: str = "devex"` field to `OpportunityRecord` dataclass in `models.py`
-    (place after `anna_benchmark` for minimal diff)
-  - Update `to_dict()` to include `"source_portal": self.source_portal`
-  - Update `from_dict()` to read `source_portal=str(data.get("source_portal", "devex"))`
+  - Make `to_dict()` a canonical serializer that emits every model field under its INTERNAL name (including `source_portal`, `devex_opportunity_id`, `description_snippet`, `matched_keywords`, `relevance_reason`, `llm_confidence`, `llm_called`, `anna_benchmark`, `scraped_at`); it uses the internal `source_portal` key ONLY and never the external `portal_source` label
+  - Ensure `from_dict(to_dict(record))` round-trips all fields; `from_dict()` reads `source_portal=str(data.get("source_portal", "devex"))`
   - _Requirements: 9.1, 9.2_
 
-  - [ ]* 2.1 Write property test for source_portal round-trip
-    - **Property 2: source_portal identity preservation**
+  - [x] 2.1 Write property test for canonical to_dict round-trip
+    - **Property 2: Canonical to_dict round-trips every field (incl. arbitrary source_portal)**
     - **Validates: Requirements 6.6, 9.1, 9.2**
 
 - [x] 3. Create BasePortalAdapter abstract base class
@@ -133,34 +132,49 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     - **Property 13: Perplexity opportunity_id is deterministic**
     - **Validates: Requirements 10.3**
 
-- [x] 7. Checkpoint — Ensure all adapter unit and property tests pass
+- [ ] 7. Checkpoint — Ensure all adapter unit and property tests pass (not satisfied on this branch: Category C adapter property tests are intentionally absent and a pre-existing main baseline test fails)
   - Ensure all tests pass, ask the user if questions arise.
 
-- [x] 8. Update SheetsAdapter to persist source_portal
-  - Add `"source_portal"` to the end of `HEADERS` list in `store/adapter_sheets.py`
-  - `write_record()` already uses `payload.get(header)` for each header — no logic change
-    needed beyond the HEADERS addition
-  - Update `get_records_since()` to call `row.setdefault("source_portal", "devex")` before
-    appending each row to results
-  - _Requirements: 9.3, 9.4, 9.6_
+- [x] 8. Update SheetsAdapter for the frozen 12-column Live_Sheet_Schema, startup header validation, and ID-method deprecation (Option A)
+  - Preserve the exact frozen 12-column `HEADERS` (Live_Sheet_Schema) unchanged — do NOT append `source_portal`
+  - Rewrite `write_record()` to explicitly project the canonical `to_dict()` payload onto the 12 external columns via `CANONICAL_KEY_FOR_COLUMN`, mapping canonical `source_portal` onto the external `portal_source` column (column 1); join `risk_flags` to a comma string; `None` -> ""
+  - Add strict startup header validation (`_ensure_headers()`/`_validate_headers()`): initialize an empty sheet with the canonical header, else reject missing / duplicate (incl. whitespace/case) / reordered / unexpected headers via `SheetsSchemaError`; never auto-repair a populated header
+  - Add `get_all_links()` (reads the `opportunity_link` column, col 7) for cross-run deduplication
+  - Make `get_all_ids()`, `record_exists()`, and `get_records_since()` unsupported for Sheets (raise `NotImplementedError`): the frozen schema has no persisted opportunity-ID column and no `scraped_at` column
+  - _Requirements: 9.3, 9.4, 9.6, 9.8, 9.9, 6.8, 10.5_
 
-  - [ ]* 8.1 Write property test for SheetsAdapter source_portal column position
-    - **Property 14: SheetsAdapter writes source_portal at correct column position**
+  - [x] 8.1 Write property test: source_portal maps to the portal_source column (frozen 12-column schema)
+    - **Property 14: SheetsAdapter maps source_portal onto the portal_source column (col 1)**
     - **Validates: Requirements 9.3, 9.4**
 
-  - [ ]* 8.2 Write property test for legacy source_portal default
-    - **Property 15: Store get_records_since returns "devex" default for legacy rows**
-    - **Validates: Requirements 9.6**
+  - [x] 8.2 Write property tests: get_all_links() link-based cross-run dedup; Sheets get_records_since() unsupported (raises); Airtable get_records_since() supplies the legacy "devex" default (distinct from the unsupported Sheets method)
+    - **Property 15: get_all_links seeds link-based cross-run dedup; Sheets get_records_since is deprecated; Airtable defaults legacy source_portal to "devex"**
+    - **Validates: Requirements 6.8, 9.6, 9.7, 10.5**
 
-- [x] 9. Update AirtableAdapter to persist source_portal
-  - Update `get_records_since()` in `store/adapter_airtable.py` to call
-    `fields.setdefault("source_portal", "devex")` before appending each record to results
-  - `write_record()` already calls `record.to_dict()` and passes the full payload — no
-    structural change needed; `source_portal` flows through automatically once `to_dict()`
-    includes it (Task 2)
-  - _Requirements: 9.5, 9.6_
+  - [x] 8.3 Write positional-alignment compatibility test
+    - Assert the written row width == len(HEADERS) == 12 and every value lands under its intended header (source_portal under portal_source at col 1, opportunity_link at col 7)
+    - _Requirements: 9.3, 9.4_
 
-- [x] 10. Refactor main.py orchestrator with adapter registry and isolated exception handling
+  - [x] 8.4 Write adversarial startup header-validation tests
+    - Cover: exact valid header; empty-sheet initialization; missing required header; duplicate exact header; duplicate after trim/case normalization; reordered header; unexpected extra header; validation occurs before any write
+    - _Requirements: 9.8_
+
+  - [x] 8.5 Write deprecation tests for get_all_ids()/record_exists()
+    - Assert both raise NotImplementedError before any worksheet call, directing callers to get_all_links()
+    - _Requirements: 9.9_
+
+- [x] 9. Update AirtableAdapter to pass canonical to_dict() through (Option A)
+  - `write_record()` forwards the canonical `to_dict()` payload to Airtable (with documented `None` -> "" normalization), so `source_portal` and `devex_opportunity_id` flow through under their internal key names
+  - Add `get_all_links()` parity (reads persisted `opportunity_link`) so cross-run dedup seeding works for the Airtable backend too
+  - `get_records_since()` supplies the legacy read default `fields.setdefault("source_portal", "devex")` for records predating the field (this remains supported for Airtable, unlike Sheets)
+  - Operational prerequisite (note, not code): the Airtable table schema MUST contain fields matching the canonical keys (in particular `source_portal` and `devex_opportunity_id`) or Airtable rejects writes to unknown field names
+  - _Requirements: 9.5, 9.6, 9.7_
+
+  - [x] 9.1 Write Airtable write_record payload test
+    - Inspect the argument passed to table.create(): complete canonical payload with documented None-normalization; includes source_portal and devex_opportunity_id; excludes external label portal_source; returns created id; updates in-memory id cache; sleep mocked
+    - _Requirements: 9.5_
+
+- [x] 10. Refactor main.py orchestrator with adapter registry, isolated exception handling, and link-based cross-run dedup (Option A)
   - Replace all existing imports from `auth/`, `scraper/` with imports from `portals/`
   - Import `BasePortalAdapter`, `DevexAdapter`, `SAMGovAdapter`, `PerplexityAdapter`
   - Build adapter registry: append each adapter only when its `enabled` flag is `True`
@@ -169,12 +183,11 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     `audit.log_error()`, call `notifier.send_error_alert(component=adapter.portal_name)`,
     then `continue` — never `return` or `raise`
   - Collect all results into `all_opportunities: list[dict]`
-  - Implement deduplication: check `opportunity_id` against `existing_ids` and `seen_ids`;
-    check `opportunity_link` against `seen_links` as fallback
+  - Seed cross-run deduplication from `store.get_all_links()` (NOT `get_all_ids()`), with cross-run identity keyed on `opportunity_link`; within a run, additionally skip a repeated non-empty `opportunity_id` and a repeated non-empty `opportunity_link`
   - Thread `source_portal` through `Opportunity_Dict` → `OpportunityRecord.from_dict()` →
     store write; include `source_portal` in `audit.log()` detail for each processed record
   - Preserve existing filter → LLM → store pipeline logic unchanged
-  - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 7.1, 7.2, 7.3, 7.4_
+  - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 7.1, 7.2, 7.3, 7.4, 10.4, 10.5_
 
   - [ ]* 10.1 Write property test for adapter registry composition
     - **Property 5: Adapter registry contains exactly the enabled adapters**
@@ -188,15 +201,15 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     - **Property 7: Failing adapters do not suppress results from healthy adapters**
     - **Validates: Requirements 6.4**
 
-  - [ ]* 10.4 Write property test for deduplication by opportunity_id
+  - [x] 10.4 Write property test for within-run deduplication by opportunity_id
     - **Property 3: Deduplication eliminates repeated opportunity_id values**
     - **Validates: Requirements 6.7, 10.4**
 
-  - [ ]* 10.5 Write property test for deduplication by opportunity_link
+  - [x] 10.5 Write property test for cross-run + within-run deduplication by opportunity_link
     - **Property 4: Deduplication eliminates repeated opportunity_link values**
-    - **Validates: Requirements 6.7**
+    - **Validates: Requirements 6.7, 6.8, 10.5**
 
-- [x] 11. Checkpoint — Ensure all tests pass
+- [ ] 11. Checkpoint — Ensure all tests pass (not satisfied on this branch: pre-existing main baseline failures remain — see baseline proof)
   - Ensure all tests pass, ask the user if questions arise.
 
 - [x] 12. Write property test for adapter result field completeness
@@ -206,7 +219,7 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
   - **Property 1: Adapter result fields are complete**
   - **Validates: Requirements 3.4, 4.4**
 
-- [x] 13. Final checkpoint — Ensure all tests pass and imports resolve
+- [ ] 13. Final checkpoint — Ensure all tests pass and imports resolve (imports resolve; full suite still has pre-existing main baseline failures)
   - Run `python -c "import main"` to verify no `ModuleNotFoundError` or `ImportError`
   - Ensure all tests pass, ask the user if questions arise.
 
@@ -260,3 +273,31 @@ UNDP-enrichment invariants and their verifying tests in
   - FULL (live mode): `test_orchestration_end_to_end_keyword_after_1000`.
 
 Unverified/partial invariants above are follow-up test gaps, not regressions: 17, 18, 19; invariant 24's remaining gap is that a cancelled/failed opportunity retains its title-based `description_snippet` and is still passed through the `KeywordFilter` (not directly asserted); invariant 25's remaining gap is the dry-run no-write case. (The dry-run gap belongs only to invariant 25; invariant 24 has no dry-run component.)
+
+## Task Dependency Graph
+
+Option A schema-contract work builds on the multi-portal baseline already on `main`.
+Leaf implementation/test tasks below are complete on this branch; checkpoints remain
+open until the full suite is green (pre-existing baseline failures are tracked separately).
+
+```mermaid
+flowchart TD
+    T2[2. Canonical to_dict] --> T2_1[2.1 round-trip test]
+    T2 --> T8[8. SheetsAdapter Option A]
+    T2 --> T9[9. AirtableAdapter passthrough]
+    T8 --> T8_1[8.1 mapping test]
+    T8 --> T8_2[8.2 get_all_links / deprecation test]
+    T8 --> T8_3[8.3 positional-alignment test]
+    T8 --> T8_4[8.4 header-validation tests]
+    T8 --> T8_5[8.5 deprecated-ID tests]
+    T9 --> T9_1[9.1 Airtable payload test]
+    T8 --> T10[10. Orchestrator link-based dedup]
+    T9 --> T10
+    T10 --> T10_4[10.4 within-run id dedup test]
+    T10 --> T10_5[10.5 cross+within-run link dedup test]
+    T2 --> C11{{11. Checkpoint: full suite}}
+    T8 --> C11
+    T9 --> C11
+    T10 --> C11
+    C11 --> C13{{13. Final checkpoint}}
+```

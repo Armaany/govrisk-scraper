@@ -2,7 +2,7 @@
 
 ## Introduction
 
-GovRisk's existing Python scraper currently targets a single portal (Devex) through tightly coupled code spread across `engine/`, `portals/`, and `main.py`. This feature refactors the system into a generic multi-portal adapter architecture, where each procurement portal is encapsulated as a self-contained adapter implementing a shared abstract interface. The refactor adds two new portal adapters — SAM.gov (free REST API) and Perplexity AI (search-based discovery) — alongside a refactored Devex adapter, and updates the orchestration layer in `main.py` to iterate over all active adapters uniformly. The existing keyword filter, LLM interpreter, store adapters, audit logger, and notifier remain unchanged.
+GovRisk's existing Python scraper currently targets a single portal (Devex) through tightly coupled code spread across `engine/`, `portals/`, and `main.py`. This feature refactors the system into a generic multi-portal adapter architecture, where each procurement portal is encapsulated as a self-contained adapter implementing a shared abstract interface. The refactor adds two new portal adapters Ã¢â‚¬â€ SAM.gov (free REST API) and Perplexity AI (search-based discovery) Ã¢â‚¬â€ alongside a refactored Devex adapter, and updates the orchestration layer in `main.py` to iterate over all active adapters uniformly. The existing keyword filter, LLM interpreter, store adapters, audit logger, and notifier remain unchanged.
 
 ## Glossary
 
@@ -11,7 +11,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 - **Devex_Adapter**: The refactored adapter for the Devex portal, replacing the current `portals/devex_auth.py` + `engine/search.py` + `engine/parser.py` combination.
 - **SAMGov_Adapter**: The adapter for the SAM.gov REST API (`api.sam.gov`).
 - **Perplexity_Adapter**: The adapter for Perplexity AI's search API used to discover procurement opportunities.
-- **Orchestrator**: The `main.py` async function that loads config, iterates over active adapters, and routes results through the filter → LLM → store pipeline.
+- **Orchestrator**: The `main.py` async function that loads config, iterates over active adapters, and routes results through the filter Ã¢â€ â€™ LLM Ã¢â€ â€™ store pipeline.
 - **Config**: The `config.py` `Config` dataclass and `load_config()` function.
 - **OpportunityRecord**: The `models.py` dataclass representing one normalized procurement opportunity.
 - **KeywordFilter**: The `engine/keyword_filter.py` class that applies sector and geography filters.
@@ -25,6 +25,9 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 - **Transient_Field**: An `Opportunity_Dict` key (`_matching_text` and `_full_overview`) that exists only in memory during a run and MUST be removed before an `OpportunityRecord` is constructed or written to any `Store`.
 - **Enrichment_Phase**: The bounded-concurrency detail-page fetching stage in `UNDP_Adapter` during which each active listing's detail page is retrieved to extract full Overview text; governed by the `_DETAIL_ENRICHMENT_DEADLINE` of 120 seconds.
 - **Enrichment_Deadline**: The 120-second wall-clock budget (`_DETAIL_ENRICHMENT_DEADLINE`) applied to the Enrichment_Phase only, excluding the listing-page fetch.
+- **source_portal (canonical field)**: The internal/canonical field name carried on `OpportunityRecord` and in the canonical serialization (`OpportunityRecord.to_dict()`) that identifies the originating portal (e.g. `"devex"`, `"samgov"`, `"perplexity"`). This is the name used throughout the in-memory data model.
+- **portal_source (external Sheet column)**: The external Google Sheets column label at column 1 of the authoritative live 12-column schema. The canonical `source_portal` value is mapped onto this external `portal_source` column when writing to Google Sheets. The two names refer to the same logical datum under different representations: `source_portal` is the internal name, `portal_source` is the external column label.
+- **Live_Sheet_Schema**: The fixed, operational 12-column Google Sheets schema that predates this feature and is authoritative: (1) `portal_source`, (2) `opportunity_title`, (3) `funder_organisation`, (4) `country_region`, (5) `deadline`, (6) `contract_value`, (7) `opportunity_link`, (8) `summary`, (9) `relevance_score`, (10) `bid_recommendation`, (11) `risk_flags`, (12) `review_status`. This schema contains no `devex_opportunity_id` column and no `scraped_at` column and is not migrated by this feature.
 
 ---
 
@@ -112,7 +115,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 
 ### Requirement 6: Orchestrator Adapter Loop
 
-**User Story:** As a developer, I want `main.py` to iterate over all active adapters in a uniform loop, so that adding a new portal requires only registering a new adapter instance — not modifying pipeline logic.
+**User Story:** As a developer, I want `main.py` to iterate over all active adapters in a uniform loop, so that adding a new portal requires only registering a new adapter instance Ã¢â‚¬â€ not modifying pipeline logic.
 
 #### Acceptance Criteria
 
@@ -121,8 +124,9 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 3. THE `Orchestrator` SHALL apply `KeywordFilter`, duplicate detection, `LLMInterpreter`, and `Store` writes to the unified list using the same logic as the current single-portal pipeline.
 4. WHEN an adapter's `fetch_opportunities()` raises an unhandled exception, THE `Orchestrator` SHALL log the error, send an error alert identifying the adapter by `portal_name`, and continue processing remaining adapters.
 5. THE `Orchestrator` SHALL include the `source_portal` value from each `Opportunity_Dict` in the audit log entry for that opportunity.
-6. THE `Orchestrator` SHALL pass the `source_portal` value from each `Opportunity_Dict` through to the `OpportunityRecord` so that it is persisted as a column in both Google Sheets and Airtable.
+6. THE `Orchestrator` SHALL pass the `source_portal` value from each `Opportunity_Dict` through to the `OpportunityRecord` so that it is persisted as `portal_source` (the external column label) in Google Sheets and as `source_portal` in Airtable.
 7. THE `Orchestrator` SHALL deduplicate across adapters using the opportunity's `opportunity_link` as the unique key when a portal-specific ID is unavailable.
+8. WHEN the `Orchestrator` initializes cross-run deduplication, THE `Orchestrator` SHALL seed its set of already-persisted opportunities from the `Store`'s persisted `opportunity_link` values obtained via a store method (such as `get_all_links`) that reads the persisted link column (column 7 of the Live_Sheet_Schema), rather than from the `portal_source` column (column 1).
 
 ---
 
@@ -133,7 +137,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 #### Acceptance Criteria
 
 1. THE `Orchestrator` SHALL import `Devex_Adapter`, `SAMGov_Adapter`, and `Perplexity_Adapter` from `portals/devex_adapter.py`, `portals/samgov_adapter.py`, and `portals/perplexity_adapter.py` respectively.
-2. THE `Orchestrator` SHALL NOT import from `engine/search.py`, `engine/parser.py`, or `portals/devex_auth.py` directly — those imports SHALL be encapsulated inside the respective adapter.
+2. THE `Orchestrator` SHALL NOT import from `engine/search.py`, `engine/parser.py`, or `portals/devex_auth.py` directly Ã¢â‚¬â€ those imports SHALL be encapsulated inside the respective adapter.
 3. WHEN the project is executed with `python main.py`, THE Python interpreter SHALL resolve all imports without raising `ModuleNotFoundError` or `ImportError`.
 4. THE `engine/keyword_filter.py`, `llm/interpreter.py`, `store/adapter_sheets.py`, `store/adapter_airtable.py`, `utils/audit.py`, and `utils/notifier.py` modules SHALL remain importable at their existing paths.
 
@@ -146,11 +150,14 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 #### Acceptance Criteria
 
 1. THE `OpportunityRecord` dataclass SHALL include a `source_portal: str` field defaulting to `"devex"` for backward compatibility.
-2. THE `OpportunityRecord.to_dict()` method SHALL include `source_portal` in its returned dictionary.
-3. THE `SheetsAdapter` HEADERS list SHALL include `"source_portal"` as a column.
-4. WHEN `SheetsAdapter.write_record()` is called, THE `SheetsAdapter` SHALL write the `source_portal` value to the corresponding column.
+2. THE `OpportunityRecord.to_dict()` method SHALL produce a canonical, round-trippable representation containing all dataclass fields under their internal names - including `source_portal`, `devex_opportunity_id`, `description_snippet`, `matched_keywords`, `relevance_reason`, `llm_confidence`, `llm_called`, `anna_benchmark`, and `scraped_at` - and SHALL NOT contain both `portal_source` and `source_portal`.
+3. THE `SheetsAdapter` SHALL preserve the existing 12-column HEADERS (the Live_Sheet_Schema) unchanged, and SHALL NOT add a new column for `source_portal`.
+4. WHEN `SheetsAdapter.write_record()` is called, THE `SheetsAdapter` SHALL map the canonical `source_portal` value onto the external `portal_source` column (column 1 of the Live_Sheet_Schema) when writing.
 5. WHEN `AirtableAdapter.write_record()` is called, THE `AirtableAdapter` SHALL include `source_portal` in the field payload sent to Airtable.
-6. WHEN reading existing records via `SheetsAdapter.get_records_since()` or `AirtableAdapter.get_records_since()`, THE Store SHALL return the `source_portal` value if present, or `"devex"` as a default for legacy rows that predate this field.
+6. WHERE the Live_Sheet_Schema is in use, THE `SheetsAdapter.get_records_since()` method SHALL be unsupported (documented and deprecated) because the schema contains no `scraped_at` column, and SHALL raise `NotImplementedError`.
+7. WHEN reading existing records via `AirtableAdapter.get_records_since()`, THE `AirtableAdapter` SHALL return the `source_portal` value if present, or `"devex"` as a default for legacy records that predate this field.
+8. WHEN a `SheetsAdapter` is initialized, THE `SheetsAdapter` SHALL validate the Sheet header row against the canonical 12-column Live_Sheet_Schema before any read or write: IF the Sheet is empty THEN the `SheetsAdapter` SHALL write the canonical 12-column header; IF row 1 is populated THEN the `SheetsAdapter` SHALL reject, by raising a dedicated `SheetsSchemaError`, any missing, duplicate (including duplicates that differ only by surrounding whitespace or letter case), reordered, or unexpected headers, and SHALL NOT rewrite or repair a populated header automatically.
+9. THE `SheetsAdapter.get_all_ids()` and `SheetsAdapter.record_exists()` methods SHALL raise `NotImplementedError` because the 12-column Live_Sheet_Schema has no persisted opportunity-ID column (column 1 is `portal_source`); cross-run deduplication SHALL instead use `SheetsAdapter.get_all_links()`. THE corresponding `AirtableAdapter.get_all_ids()` and `AirtableAdapter.record_exists()` methods SHALL remain functional because Airtable persists `devex_opportunity_id`.
 
 ---
 
@@ -163,7 +170,10 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 1. THE `Devex_Adapter` SHALL set `opportunity_id` in each `Opportunity_Dict` using the existing `devex-XXXXXX` format derived from the URL.
 2. THE `SAMGov_Adapter` SHALL set `opportunity_id` in each `Opportunity_Dict` using the format `samgov-{noticeId}` where `noticeId` is the SAM.gov API field.
 3. THE `Perplexity_Adapter` SHALL set `opportunity_id` in each `Opportunity_Dict` using the format `perplexity-{hash}` where `hash` is a deterministic hash of the `opportunity_link`.
-4. WHEN two adapters return an `Opportunity_Dict` with the same `opportunity_id`, THE `Orchestrator` SHALL treat the second occurrence as a duplicate and skip it.
+4. WHEN, within a single run, two adapters return an `Opportunity_Dict` with the same `opportunity_id`, THE `Orchestrator` SHALL treat the second occurrence as a within-run duplicate and skip it.
+5. WHERE cross-run (persisted-record) deduplication is performed, THE `Orchestrator` SHALL key deduplication on `opportunity_link` rather than `opportunity_id`, because the Live_Sheet_Schema has no persisted `opportunity_id` column.
+
+---
 
 ### Requirement 11: UNDP Description Enrichment and Full-Text Keyword Matching
 

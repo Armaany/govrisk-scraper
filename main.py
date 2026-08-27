@@ -45,9 +45,14 @@ async def build_adapter_registry(config) -> list[BasePortalAdapter]:
 
 def deduplicate_opportunities(
     all_opportunities: list[dict],
-    existing_ids: set,
+    existing_links: set,
 ) -> tuple[list[dict], int]:
-    """Deduplicate opportunities by opportunity_id then opportunity_link.
+    """Deduplicate opportunities across runs and within a run (Option A).
+
+    Cross-run dedup keys on ``opportunity_link``, checked against ``existing_links``
+    which is seeded from the persisted ``opportunity_link`` column (col 7) via
+    ``store.get_all_links()``. Within a run, a repeated ``opportunity_id`` (Req 10.4)
+    AND a repeated ``opportunity_link`` (Req 10.5 / 6.7) are also skipped.
 
     Returns (deduplicated_list, duplicates_skipped_count).
     """
@@ -60,10 +65,17 @@ def deduplicate_opportunities(
         opp_id = opp.get("opportunity_id", "")
         opp_link = opp.get("opportunity_link", "")
 
-        if opp_id and (opp_id in existing_ids or opp_id in seen_ids):
+        # Cross-run dedup: link already persisted in a prior run.
+        if opp_link and opp_link in existing_links:
             duplicates_skipped += 1
             continue
 
+        # Within-run dedup: repeated id.
+        if opp_id and opp_id in seen_ids:
+            duplicates_skipped += 1
+            continue
+
+        # Within-run dedup: repeated link.
         if opp_link and opp_link in seen_links:
             duplicates_skipped += 1
             continue
@@ -92,7 +104,11 @@ async def run_scraper():
     else:
         print(f"Store ready — RUN_MODE={config.run_mode}")
 
-    existing_ids: set[str] = set(store.get_all_ids())
+    # Cross-run dedup is seeded from the persisted opportunity_link column (col 7)
+    # via get_all_links(). The former ID-based path was invalid under the frozen
+    # Live_Sheet_Schema (which has no persisted opportunity-ID column) and is now
+    # deprecated: SheetsAdapter.get_all_ids() raises NotImplementedError (Req 6.8).
+    existing_links: set[str] = set(store.get_all_links())
 
     total_scraped = 0
     total_matched = 0
@@ -125,7 +141,7 @@ async def run_scraper():
             continue
 
     # Deduplication across all adapters
-    deduplicated, run_duplicates = deduplicate_opportunities(all_opportunities, existing_ids)
+    deduplicated, run_duplicates = deduplicate_opportunities(all_opportunities, existing_links)
     duplicates_skipped += run_duplicates
 
     # Filter → LLM → Store pipeline
@@ -167,7 +183,9 @@ async def run_scraper():
                 try:
                     store.write_record(record)
                     total_written += 1
-                    existing_ids.add(record.devex_opportunity_id)
+                    # Track link-based so subsequent writes in this process see it.
+                    if record.opportunity_link:
+                        existing_links.add(record.opportunity_link)
                 except StoreWriteError as exc:
                     errors += 1
                     audit.log_error(str(exc), opportunity_id=record.devex_opportunity_id)

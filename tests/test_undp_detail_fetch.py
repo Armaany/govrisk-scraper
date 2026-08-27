@@ -619,7 +619,7 @@ async def test_orchestration_end_to_end_keyword_after_1000():
     written_records = []
     mock_store = MagicMock()
     mock_store.test_connection.return_value = True
-    mock_store.get_all_ids.return_value = set()
+    mock_store.get_all_links.return_value = set()
     mock_store.write_record.side_effect = lambda r: written_records.append(r)
 
     mock_audit = MagicMock()
@@ -652,6 +652,12 @@ async def test_orchestration_end_to_end_keyword_after_1000():
          patch("main.LLMInterpreter", return_value=mock_interpreter), \
          patch("main.build_adapter_registry", side_effect=fake_registry):
         await main.run_scraper()
+
+    # 0. Cross-run dedup uses get_all_links (Option A contract)
+    mock_store.get_all_links.assert_called_once()
+    assert not mock_store.get_all_ids.called, (
+        "get_all_ids is deprecated; cross-run dedup must use get_all_links"
+    )
 
     # 1. write_record called exactly once
     assert mock_store.write_record.call_count == 1, (
