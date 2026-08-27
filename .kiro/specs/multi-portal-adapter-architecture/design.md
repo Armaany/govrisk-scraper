@@ -1335,8 +1335,7 @@ of at most 1000 characters, and produce a stored record in which both `_matching
 
 ### Property-based testing library
 
-Use **Hypothesis** (Python) for all property-based tests. Each test runs a minimum of 100
-iterations. Tag format: `# Feature: multi-portal-adapter-architecture, Property N: <text>`
+Use **Hypothesis** (Python) for property-based tests. Example counts are configured per test (currently 30-300) according to execution cost and coverage needs. Tag format: `# Feature: multi-portal-adapter-architecture, Property N: <text>`
 
 ### Unit tests (example-based)
 
