@@ -1,4 +1,6 @@
 """Unit and property-based tests for SAMGovAdapter."""
+import asyncio
+
 import pytest
 import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -100,6 +102,28 @@ async def test_http_4xx_returns_empty_and_logs_error():
 
 
 @pytest.mark.asyncio
+async def test_http_5xx_returns_empty_and_logs_error():
+    """When SAM.gov returns HTTP 5xx, fetch_opportunities returns [] and logs the error."""
+    config = make_config()
+    adapter = SAMGovAdapter(config)
+
+    mock_response = _make_mock_response([], status_code=503)
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    with (
+        patch("portals.samgov_adapter.httpx.AsyncClient", return_value=mock_client),
+        patch.object(adapter, "_log_http_error") as mock_log,
+    ):
+        result = await adapter.fetch_opportunities()
+
+    assert result == []
+    mock_log.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_successful_fetch_maps_results():
     """A successful response maps items to Opportunity_Dict with correct fields."""
     config = make_config()
@@ -147,34 +171,60 @@ async def test_non_latam_items_filtered_out():
 
 
 # ---------------------------------------------------------------------------
-# Property 9: SAM.gov query params reflect Config values
+# Feature: multi-portal-adapter-architecture, Property 9: SAM.gov query params
+# reflect Config values
 # Validates: Requirements 3.3
 # ---------------------------------------------------------------------------
 
 @given(
-    keywords=st.lists(st.text(min_size=1, max_size=20, alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd"))), min_size=1, max_size=5),
+    keywords=st.lists(
+        st.text(
+            min_size=1,
+            max_size=20,
+            alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd")),
+        ),
+        min_size=1,
+        max_size=5,
+    ),
     max_results=st.integers(min_value=1, max_value=200),
+    api_key=st.text(
+        min_size=1,
+        max_size=40,
+        alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd")),
+    ),
 )
 @settings(max_examples=50)
-def test_samgov_query_params_reflect_config(keywords: list[str], max_results: int):
+def test_samgov_query_params_reflect_config(
+    keywords: list[str], max_results: int, api_key: str
+):
     """
     **Validates: Requirements 3.3**
-    Property 9: For any Config with any sector_keywords and max_results,
-    the HTTP request must include q=space-joined keywords and limit=max_results.
+    Property 9: For any Config with arbitrary sector_keywords, max_results, and a
+    valid api_key, the HTTP request built by SAMGovAdapter must include
+    q=space-joined sector_keywords, limit=max_results, and api_key=samgov_api_key.
+
+    The params are captured by mocking httpx.AsyncClient.get to record the params
+    argument while running fetch_opportunities with samgov_enabled=True against a
+    benign JSON body.
     """
-    config = make_config(sector_keywords=keywords, max_results=max_results)
+    config = make_config(
+        sector_keywords=keywords,
+        max_results=max_results,
+        samgov_enabled=True,
+        samgov_api_key=api_key,
+    )
     adapter = SAMGovAdapter(config)
 
-    captured_params = {}
+    captured_params: dict = {}
 
     async def fake_get(url, params=None, **kwargs):
+        # Record the params argument passed to httpx.AsyncClient.get.
+        captured_params.clear()
         captured_params.update(params or {})
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.return_value = {"opportunitiesData": []}
         return mock_resp
-
-    import asyncio
 
     mock_client = MagicMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -182,14 +232,16 @@ def test_samgov_query_params_reflect_config(keywords: list[str], max_results: in
     mock_client.get = fake_get
 
     with patch("portals.samgov_adapter.httpx.AsyncClient", return_value=mock_client):
-        asyncio.get_event_loop().run_until_complete(adapter.fetch_opportunities())
+        asyncio.run(adapter.fetch_opportunities())
 
     assert captured_params["q"] == " ".join(keywords)
     assert captured_params["limit"] == max_results
+    assert captured_params["api_key"] == api_key
 
 
 # ---------------------------------------------------------------------------
-# Property 12: SAM.gov opportunity_id matches portal-prefixed format
+# Feature: multi-portal-adapter-architecture, Property 12: SAM.gov opportunity_id
+# matches portal-prefixed format
 # Validates: Requirements 10.2
 # ---------------------------------------------------------------------------
 
@@ -218,7 +270,8 @@ def test_samgov_id_format(notice_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Property 16: LATAM post-filter excludes non-target countries
+# Feature: multi-portal-adapter-architecture, Property 16: SAMGovAdapter LATAM
+# post-filter excludes non-target countries
 # Validates: Requirements 3.4, 3.3
 # ---------------------------------------------------------------------------
 
