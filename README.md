@@ -93,4 +93,3 @@ Stubbed project scaffold based on `SCRAPER_SPEC.md`.
 - Short sector keywords audited for substring false-positive risk; only "aml" (3 characters) flagged, risk assessed as negligible.
 
 - Devex adapter currently disabled - authentication failing since April 2026.
-
