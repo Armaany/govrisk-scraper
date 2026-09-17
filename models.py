@@ -122,7 +122,13 @@ class OpportunityRecord:
                 f"Got naive datetime: {dt.isoformat()}"
             )
         utc_dt = dt.astimezone(timezone.utc)
-        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Preserve full precision (including microseconds) for a faithful
+        # to_dict()/from_dict() round-trip (Req 9.2). isoformat() emits the UTC
+        # offset as "+00:00"; replace only that terminal offset with "Z".
+        iso = utc_dt.isoformat()
+        if iso.endswith("+00:00"):
+            iso = iso[:-6] + "Z"
+        return iso
 
     def serialize_matched_keywords_for_sheet(self) -> str:
         """Serialize matched_keywords as a JSON array for the Sheet cell.

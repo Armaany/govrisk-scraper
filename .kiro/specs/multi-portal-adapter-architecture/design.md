@@ -710,29 +710,43 @@ async def run_scraper():
 - `source_portal` is carried through `Opportunity_Dict` → `OpportunityRecord` → store write
 - The filter/LLM/store pipeline code is identical to the current implementation
 
-## Schema Contract (Option A)
+## Schema Contract (v1.1 — authoritative; supersedes Option A / v1.0)
 
-This feature adopts **Option A**: the live Google Sheet is treated as a fixed, authoritative
-schema that is **not migrated**. The contract that governs serialization and persistence:
+The authoritative contract is **schema v1.1** (Task 14): the `Live_Sheet_Schema` is
+**14 required columns**, writing is **header-name-driven**, reordered required headers are
+accepted, unknown extra columns are accepted and written as blank, and a populated header row
+is **never rewritten automatically**. The contract that governs serialization and persistence:
 
 - **Canonical internal vs. external names.** The in-memory data model uses the canonical field
   name **`source_portal`**. The Google Sheet exposes the same datum under the external column
   label **`portal_source`** (column 1). `OpportunityRecord.to_dict()` is canonical and emits only
   `source_portal`; the `SheetsAdapter` presentation layer maps `source_portal → portal_source`
   when writing. The two names are the same logical value in different representations.
-- **12-column Sheet is frozen.** `SheetsAdapter.HEADERS` remains the existing 12 columns
+- **14-column Live_Sheet_Schema.** `SheetsAdapter.HEADERS` is the 14 canonical columns
   (`portal_source`, `opportunity_title`, `funder_organisation`, `country_region`, `deadline`,
   `contract_value`, `opportunity_link`, `summary`, `relevance_score`, `bid_recommendation`,
-  `risk_flags`, `review_status`). No `source_portal`, `devex_opportunity_id`, or `scraped_at`
-  column is added, and the live Sheet is not rewritten.
+  `risk_flags`, `review_status`, `scraped_at`, `matched_keywords`). `scraped_at` and
+  `matched_keywords` ARE written: `scraped_at` as UTC ISO 8601 with a `Z` suffix (full precision,
+  including microseconds), `matched_keywords` as a UTF-8 JSON array. Historical rows may have
+  blank `scraped_at`/`matched_keywords` values, which remain valid for readers.
 - **Canonical `to_dict()` is round-trippable.** It emits every dataclass field under its internal
-  name so that `from_dict(to_dict(record))` reproduces the record. Fields with no external column
-  are simply not projected by `SheetsAdapter.write_record()`.
+  name so that `from_dict(to_dict(record))` reproduces the record exactly (including `scraped_at`
+  microseconds). Canonical fields with no external column are not projected by
+  `SheetsAdapter.write_record()`.
 - **Link-based cross-run dedup.** Cross-run deduplication is keyed on `opportunity_link`, seeded
   from `SheetsAdapter.get_all_links()` (column 7), replacing the old `get_all_ids()`-on-column-1
   approach.
-- **`get_records_since()` deprecated.** With no `scraped_at` column in the Live_Sheet_Schema,
-  `SheetsAdapter.get_records_since()` is unsupported and raises `NotImplementedError` by contract (matching the implementation).
+- **`get_records_since()` intentionally unsupported for this demo.** It raises
+  `NotImplementedError`. Tool 2 reads rows by header name and performs its own
+  grouping/filtering; it does not rely on `get_records_since()`. (This is a demo-scope decision,
+  not a claim that `scraped_at` is absent — `scraped_at` is a required v1.1 column.)
+
+> **Historical (superseded).** Earlier drafts described "Option A" / schema **v1.0**: a frozen
+> **12-column** Sheet without `scraped_at`/`matched_keywords`, positional writing, and a claim
+> that the Sheet was "not migrated." That contract is **historical and superseded by schema
+> v1.1 (Task 14)**. Where older prose below still refers to the 12-column frozen schema, read it
+> as historical background; the 14-column, header-name-driven v1.1 contract above is
+> authoritative.
 
 ---
 
@@ -805,18 +819,18 @@ may have blank `scraped_at`/`matched_keywords` values; this is valid.
 
 #### `write_record()` — header-name-driven projection (canonical → external columns)
 
-`to_dict()` now returns the **canonical** dict keyed by internal field names. Because the
-external sheet uses `portal_source` (not the internal `source_portal`) and exposes only 12 of the
-canonical fields, `write_record()` performs an **explicit ordered projection** from canonical
-keys onto the 12 external columns. In particular, canonical `source_portal` is written into the
-external `portal_source` column (column 1); the other 11 columns are written from their canonical
-counterparts. Writes stay positionally aligned with the live header row.
+`to_dict()` returns the **canonical** dict keyed by internal field names. `write_record()`
+projects those canonical values onto the sheet **by normalized header name** (not by position),
+reading the live header row so required columns may appear in any order and unknown extra
+columns receive blank values. Canonical `source_portal` is written under the external
+`portal_source` header; `scraped_at` (UTC ISO 8601 with `Z`, full precision) and
+`matched_keywords` (UTF-8 JSON array) are written under their v1.1 columns.
 
 ```python
 def write_record(self, record: OpportunityRecord) -> str:
     payload = record.to_dict()  # canonical, internal names
 
-    # Ordered projection: external HEADERS column -> canonical payload key.
+    # Header-name-driven projection: external header -> canonical payload key.
     # Only the source_portal <-> portal_source name differs; the rest map 1:1.
     CANONICAL_KEY_FOR_COLUMN = {
         "portal_source":       "source_portal",   # external label <- canonical field
@@ -831,16 +845,22 @@ def write_record(self, record: OpportunityRecord) -> str:
         "bid_recommendation":  "bid_recommendation",
         "risk_flags":          "risk_flags",
         "review_status":       "review_status",
+        "scraped_at":          "scraped_at",       # v1.1: UTC ISO 8601 with Z
+        "matched_keywords":    "matched_keywords", # v1.1: UTF-8 JSON array
     }
-    row = [payload.get(CANONICAL_KEY_FOR_COLUMN[header], "") for header in self.HEADERS]
+    # Bind by the live header row's names (any order); unknown extra columns
+    # get blank values; a populated header is never rewritten.
+    row = [payload.get(CANONICAL_KEY_FOR_COLUMN.get(header, ""), "")
+           for header in live_header_row]
     self.worksheet.append_row(row, value_input_option="RAW")
     ...
 ```
 
-The canonical fields that have no column in the Live_Sheet_Schema (`devex_opportunity_id`,
-`description_snippet`, `matched_keywords`, `relevance_reason`, `llm_confidence`, `llm_called`,
-`anna_benchmark`, `scraped_at`) are simply not projected — they remain available in memory and in
-`to_dict()` for round-tripping, but are not written to the sheet.
+Canonical fields WITH a v1.1 column — including `scraped_at` and `matched_keywords` — ARE
+written. The remaining canonical fields that have no column in the Live_Sheet_Schema
+(`devex_opportunity_id`, `description_snippet`, `relevance_reason`, `llm_confidence`,
+`llm_called`, `anna_benchmark`) are simply not projected — they remain available in memory and
+in `to_dict()` for round-tripping, but are not written to the sheet.
 
 #### Deduplication: `get_all_links()` replaces `get_all_ids()`-on-column-1
 
@@ -870,12 +890,13 @@ header name and perform its own grouping/filtering. Raises `NotImplementedError`
 
 ```python
 def get_records_since(self, since: datetime) -> list:
-    """Unsupported for this demo. Tool 2 reads rows by header name.
-    Raises NotImplementedError by contract (Req 9.6); use get_all_links() for
-    cross-run deduplication."""
+    """Intentionally unsupported for this demo. Tool 2 reads rows by header
+    name and performs its own grouping/filtering. Raises NotImplementedError
+    (Req 9.6); use get_all_links() for cross-run deduplication."""
     raise NotImplementedError(
-        "get_records_since() is not supported under the Live_Sheet_Schema "
-        "(no 'scraped_at' column). Use get_all_links() for cross-run dedup."
+        "get_records_since() is intentionally unsupported for this demo. "
+        "Tool 2 reads rows by header name; use get_all_links() for cross-run "
+        "deduplication."
     )
 ```
 
@@ -911,7 +932,7 @@ to Airtable automatically — no structural change is required.
 > the canonical keys** — in particular `source_portal` and `devex_opportunity_id`. Airtable
 > rejects writes to unknown field names. Ensuring these columns exist in the Airtable base is an
 > operational prerequisite, not a code change in this feature. (Unlike the Google Sheet, Airtable
-> is not constrained to the frozen 12-column Live_Sheet_Schema.)
+> is not constrained to the fixed Live_Sheet_Schema column set.)
 
 For Airtable, `get_records_since()` keeps the legacy default (Req 9.7): records that predate the
 `source_portal` field default to `"devex"`:
@@ -1136,13 +1157,14 @@ produce the same `opportunity_id`, and that ID must match the pattern `perplexit
 
 ---
 
-### Property 14: SheetsAdapter maps source_portal onto the portal_source column (col 1)
+### Property 14: SheetsAdapter maps source_portal onto the portal_source column
 
 *For any* `OpportunityRecord` with any `source_portal` value, the row written by
-`SheetsAdapter.write_record()` must be exactly 12 columns wide (the unchanged Live_Sheet_Schema)
-and must contain that `source_portal` value at the index of `"portal_source"` in `HEADERS`
-(column 1), with each remaining column populated from its canonical counterpart. `HEADERS` must
-remain the frozen 12-column schema (no `source_portal` column appended).
+`SheetsAdapter.write_record()` must place that `source_portal` value under the `portal_source`
+header (schema v1.1: header-name-driven, so the position follows the live header row), with each
+other column populated from its canonical counterpart by header name. `scraped_at` is written as
+UTC ISO 8601 with a `Z` suffix and `matched_keywords` as a UTF-8 JSON array. `HEADERS` is the
+14-column v1.1 Live_Sheet_Schema and never carries a literal `source_portal` column.
 
 **Validates: Requirements 9.3, 9.4**
 
@@ -1173,13 +1195,13 @@ item for which `_is_latam_relevant()` returns `False`.
 
 ---
 
-### Property 17: SheetsAdapter rejects incompatible headers on init
+### Property 17: SheetsAdapter validates headers on init (schema v1.1)
 
-*For any* populated header row that is not exactly the canonical 12-column
-`HEADERS` (missing, duplicate incl. whitespace/case-only, reordered, or
-unexpected), `SheetsAdapter._ensure_headers()` must raise `SheetsSchemaError`
-before any write, and must never rewrite a populated header. An empty sheet is
-initialized with the canonical header.
+*For any* populated header row, `SheetsAdapter._ensure_headers()` must accept it when all 14
+required v1.1 columns are present in any order (extra unknown columns allowed, written blank),
+and must raise `SheetsSchemaError` before any write when a required column is missing or a
+duplicate (including whitespace/case-only duplicates) is present. It must never rewrite a
+populated header. An empty sheet is initialized with the canonical 14-column header.
 
 **Validates: Requirements 9.8**
 

@@ -2,17 +2,20 @@
 
 Feature: multi-portal-adapter-architecture
 
-Under the Option A schema contract the live Google Sheet keeps its frozen
-12-column ``Live_Sheet_Schema`` whose first column is the external label
+Under the schema v1.1 contract the live Google Sheet uses the 14-column
+``Live_Sheet_Schema`` whose column 1 header is the external label
 ``portal_source``. The canonical model field is ``source_portal``; the
-``SheetsAdapter`` projects it onto the external ``portal_source`` column.
+``SheetsAdapter`` writes it under the external ``portal_source`` header
+(header-name-driven, not positional). (Historical: Option A / schema v1.0 was
+12 columns with positional writing — superseded by Task 14 / schema v1.1.)
 
 This module covers:
-- Property 14: source_portal is written to the portal_source column (col 1).
-- Property 15: get_records_since() is unsupported (raises).
-- Startup header validation (schema v1.0): initialize-if-empty, else strict
-  validation rejecting missing/duplicate/reordered/unexpected headers, never
-  auto-repairing a populated header, validating before any write.
+- Property 14: source_portal is written under the portal_source header.
+- Property 15: get_records_since() is intentionally unsupported (raises).
+- Startup header validation (schema v1.1): initialize-if-empty with the
+  canonical 14-column header; accept required columns in any order and unknown
+  extra columns; reject missing/duplicate headers; never auto-repair a
+  populated header; validate before any write.
 - Deprecation of get_all_ids()/record_exists() (no persisted ID column).
 """
 import sys
@@ -137,13 +140,13 @@ def test_property_15_get_records_since_unsupported_for_sheets():
 # ---------------------------------------------------------------------------
 
 def test_valid_header_passes_validation():
-    """The exact canonical 12-column header validates without raising."""
+    """The exact canonical 14-column header validates without raising."""
     adapter = _make_adapter()
     adapter._validate_headers(list(SheetsAdapter.HEADERS))  # must not raise
 
 
 def test_empty_sheet_initializes_canonical_header():
-    """An empty sheet is initialized by writing the canonical 12-column header."""
+    """An empty sheet is initialized by writing the canonical 14-column header."""
     adapter = _make_adapter()
     adapter.worksheet.row_values.return_value = []  # empty row 1
     appended = []

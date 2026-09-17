@@ -1,11 +1,12 @@
-"""Property-based test for the frozen 12-column schema and the
+"""Property-based test for the schema v1.1 (14-column) contract and the
 source_portal -> portal_source mapping performed by SheetsAdapter.
 
 # Feature: multi-portal-adapter-architecture, Property 14: SheetsAdapter maps source_portal onto the portal_source column (col 1)
 
 **Validates: Requirements 9.3, 9.4**
-- Requirement 9.3: The SheetsAdapter preserves the existing 12-column HEADERS
-  (the Live_Sheet_Schema) unchanged and does NOT add a column for source_portal.
+- Requirement 9.3: The SheetsAdapter uses the 14-column v1.1 HEADERS
+  (the Live_Sheet_Schema) and does NOT add a literal source_portal column;
+  source_portal is written under the external portal_source header.
 - Requirement 9.4: When write_record()/_project_row runs, the canonical
   source_portal value is mapped onto the external portal_source column
   (column 1 of the Live_Sheet_Schema).
@@ -34,7 +35,7 @@ from store.adapter_sheets import SheetsAdapter  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# The frozen 12-column Live_Sheet_Schema (authoritative, must never change).
+# The schema v1.1 Live_Sheet_Schema (14 columns; authoritative).
 # ---------------------------------------------------------------------------
 FROZEN_HEADERS = [
     "portal_source",
@@ -122,9 +123,9 @@ def _records(draw):
 
 
 # ---------------------------------------------------------------------------
-# Test: HEADERS remains the frozen 12-column schema (no source_portal appended).
+# Test: HEADERS is the 14-column v1.1 schema (no literal source_portal column).
 # ---------------------------------------------------------------------------
-def test_headers_is_frozen_12_column_schema():
+def test_headers_is_schema_v11_14_column():
     """HEADERS must be exactly the frozen 14-column Live_Sheet_Schema v1.1.
 
     **Validates: Requirements 9.3**

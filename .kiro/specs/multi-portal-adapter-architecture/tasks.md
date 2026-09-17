@@ -135,12 +135,12 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
 - [x] 7. Checkpoint — Ensure all adapter unit and property tests pass (satisfied: all adapter unit and property tests pass; 62/62 green property tests are intentionally absent and a pre-existing main baseline test fails)
   - Ensure all tests pass, ask the user if questions arise.
 
-- [x] 8. Update SheetsAdapter for the frozen 12-column Live_Sheet_Schema, startup header validation, and ID-method deprecation (Option A)
+- [x] 8. Update SheetsAdapter for the Live_Sheet_Schema, startup header validation, and ID-method deprecation (Option A / schema v1.0 — historical; superseded by Task 14 / schema v1.1)
   - Preserve the exact frozen 12-column `HEADERS` (Live_Sheet_Schema) unchanged — do NOT append `source_portal`
   - Rewrite `write_record()` to explicitly project the canonical `to_dict()` payload onto the 12 external columns via `CANONICAL_KEY_FOR_COLUMN`, mapping canonical `source_portal` onto the external `portal_source` column (column 1); join `risk_flags` to a comma string; `None` -> ""
   - Add strict startup header validation (`_ensure_headers()`/`_validate_headers()`): initialize an empty sheet with the canonical header, else reject missing / duplicate (incl. whitespace/case) / reordered / unexpected headers via `SheetsSchemaError`; never auto-repair a populated header
   - Add `get_all_links()` (reads the `opportunity_link` column, col 7) for cross-run deduplication
-  - Make `get_all_ids()`, `record_exists()`, and `get_records_since()` unsupported for Sheets (raise `NotImplementedError`): the frozen schema has no persisted opportunity-ID column and no `scraped_at` column
+  - Make `get_all_ids()`, `record_exists()`, and `get_records_since()` unsupported for Sheets (raise `NotImplementedError`): there is no persisted opportunity-ID column, and `get_records_since()` is intentionally unsupported for this demo (Tool 2 reads by header name). NOTE: superseded by Task 14 — under schema v1.1 `scraped_at` IS a required, written column
   - _Requirements: 9.3, 9.4, 9.6, 9.8, 9.9, 6.8, 10.5_
 
   - [x] 8.1 Write property test: source_portal maps to the portal_source column (frozen 12-column schema)
@@ -152,7 +152,7 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     - **Validates: Requirements 6.8, 9.6, 9.7, 10.5**
 
   - [x] 8.3 Write positional-alignment compatibility test
-    - Assert the written row width == len(HEADERS) == 12 and every value lands under its intended header (source_portal under portal_source at col 1, opportunity_link at col 7)
+    - Assert the written row width == len(HEADERS) and every value lands under its intended header by header name (source_portal under portal_source, opportunity_link under opportunity_link). NOTE: schema v1.0 had 12 columns; superseded by Task 14 / schema v1.1 (14 columns, header-name-driven)
     - _Requirements: 9.3, 9.4_
 
   - [x] 8.4 Write adversarial startup header-validation tests

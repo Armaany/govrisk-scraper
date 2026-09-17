@@ -98,7 +98,7 @@ def _records(draw):
                 min_value=datetime(2000, 1, 1),
                 max_value=datetime(2100, 1, 1),
                 timezones=st.just(timezone.utc),
-            ).map(lambda dt: dt.replace(microsecond=0))
+            )
         ),
         source_portal=draw(_source_portal),
     )
@@ -154,8 +154,19 @@ def test_property_2_canonical_to_dict_round_trip(record):
 @given(
     payload=st.fixed_dictionaries(
         {
-            "opportunity_title": st.text(max_size=40),
-            "opportunity_link": st.text(max_size=40),
+            # Constrain to the same bounded printable-ASCII alphabet as _text.
+            # The unbounded full-Unicode st.text() default made this property
+            # stall under Hypothesis in some environments; the default-"devex"
+            # behaviour does not depend on the alphabet, so bounding it keeps
+            # the test deterministic without weakening the assertion.
+            "opportunity_title": st.text(
+                alphabet=st.characters(min_codepoint=32, max_codepoint=126),
+                max_size=40,
+            ),
+            "opportunity_link": st.text(
+                alphabet=st.characters(min_codepoint=32, max_codepoint=126),
+                max_size=40,
+            ),
         }
     )
 )
@@ -184,3 +195,65 @@ def test_default_source_portal_is_devex():
     )
     assert record.source_portal == "devex"
     assert record.scraped_at is not None and isinstance(record.scraped_at, datetime)
+
+
+# ---------------------------------------------------------------------------
+# scraped_at round-trip fidelity (microsecond precision + Z suffix)
+#
+# **Validates: Requirements 9.2**
+# ---------------------------------------------------------------------------
+
+def _record_with_scraped_at(scraped_at):
+    return OpportunityRecord(
+        devex_opportunity_id="id-1",
+        opportunity_title="Title",
+        funder_organisation="Org",
+        country_region="Colombia",
+        deadline=None,
+        contract_value=None,
+        opportunity_link="https://example.com/1",
+        description_snippet="snippet",
+        scraped_at=scraped_at,
+    )
+
+
+def test_scraped_at_microseconds_preserved_in_serialization():
+    """Nonzero microseconds survive serialization (no strftime truncation)."""
+    from datetime import timezone
+    record = _record_with_scraped_at(
+        datetime(2025, 1, 15, 10, 30, 0, 123456, tzinfo=timezone.utc)
+    )
+    serialized = record.to_dict()["scraped_at"]
+    assert serialized == "2025-01-15T10:30:00.123456Z"
+    assert serialized.endswith("Z")
+
+
+def test_scraped_at_microseconds_round_trip_equal():
+    """from_dict(to_dict(record)) == record for a microsecond timestamp."""
+    from datetime import timezone
+    record = _record_with_scraped_at(
+        datetime(2025, 1, 15, 10, 30, 0, 123456, tzinfo=timezone.utc)
+    )
+    restored = OpportunityRecord.from_dict(record.to_dict())
+    assert restored == record
+    assert restored.scraped_at.microsecond == 123456
+
+
+def test_scraped_at_non_utc_converts_without_losing_precision():
+    """A non-UTC aware timestamp converts to UTC keeping microseconds."""
+    from datetime import timezone, timedelta
+    eastern = timezone(timedelta(hours=-5))
+    record = _record_with_scraped_at(
+        datetime(2025, 6, 15, 10, 30, 0, 654321, tzinfo=eastern)
+    )
+    serialized = record.to_dict()["scraped_at"]
+    # 10:30 -05:00 == 15:30 UTC, microseconds intact.
+    assert serialized == "2025-06-15T15:30:00.654321Z"
+
+
+def test_scraped_at_naive_datetime_rejected():
+    """Naive datetimes are still rejected on serialization."""
+    import pytest
+    record = _record_with_scraped_at(datetime(2025, 1, 15, 10, 30, 0))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        record.to_dict()
