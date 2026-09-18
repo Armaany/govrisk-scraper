@@ -835,30 +835,16 @@ columns receive blank values. Canonical `source_portal` is written under the ext
 
 ```python
 def write_record(self, record: OpportunityRecord) -> str:
-    payload = record.to_dict()  # canonical, internal names
-
-    # Header-name-driven projection: external header -> canonical payload key.
-    # Only the source_portal <-> portal_source name differs; the rest map 1:1.
-    CANONICAL_KEY_FOR_COLUMN = {
-        "portal_source":       "source_portal",   # external label <- canonical field
-        "opportunity_title":   "opportunity_title",
-        "funder_organisation": "funder_organisation",
-        "country_region":      "country_region",
-        "deadline":            "deadline",
-        "contract_value":      "contract_value",
-        "opportunity_link":    "opportunity_link",
-        "summary":             "summary",
-        "relevance_score":     "relevance_score",
-        "bid_recommendation":  "bid_recommendation",
-        "risk_flags":          "risk_flags",
-        "review_status":       "review_status",
-        "scraped_at":          "scraped_at",       # v1.1: UTC ISO 8601 with Z
-        "matched_keywords":    "matched_keywords", # v1.1: UTF-8 JSON array
-    }
-    # Bind by the live header row's names (any order); unknown extra columns
-    # get blank values; a populated header is never rewritten.
-    row = [payload.get(CANONICAL_KEY_FOR_COLUMN.get(header, ""), "")
-           for header in live_header_row]
+    # _project_row() performs the full canonical -> external projection:
+    #   - header normalization: binds values by normalized live header name
+    #     (any order), mapping canonical source_portal -> portal_source;
+    #   - JSON serialization: matched_keywords via
+    #     record.serialize_matched_keywords_for_sheet() (UTF-8 JSON array,
+    #     ensure_ascii=False) and risk_flags joined to a comma-separated string;
+    #   - unknown-column blanking: headers with no canonical mapping get "".
+    # Note: values are NOT read directly off to_dict() — matched_keywords must
+    # be the serialized JSON array string, never a raw Python list.
+    row = self._project_row(record)
     self.worksheet.append_row(row, value_input_option="RAW")
     ...
 ```

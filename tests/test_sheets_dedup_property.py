@@ -6,8 +6,9 @@ deprecation of get_records_since() under the Live_Sheet_Schema.
 **Validates: Requirements 6.8, 9.6, 9.7, 10.5**
 - Requirement 6.8: cross-run dedup is seeded from the persisted opportunity_link
   column (column 7) via get_all_links(), not from portal_source (column 1).
-- Requirement 9.6: get_records_since() is unsupported/deprecated under the
-  Live_Sheet_Schema (no scraped_at column) and raises or returns empty.
+- Requirement 9.6: schema v1.1 requires a scraped_at column, yet
+  get_records_since() remains unsupported/deprecated for Sheets solely by a
+  demo-scope decision (not for lack of a scraped_at column); it raises.
 - Requirement 9.7: AirtableAdapter.get_records_since() returns source_portal if
   present, else defaults legacy records to "devex".
 - Requirement 10.5: cross-run dedup keys on opportunity_link.
