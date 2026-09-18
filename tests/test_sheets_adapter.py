@@ -118,14 +118,18 @@ def test_property_14_write_record_maps_source_portal_to_portal_source_column(sou
 
 
 # ---------------------------------------------------------------------------
-# Property 15: SheetsAdapter.get_records_since() is unsupported under the
-# Live_Sheet_Schema (no scraped_at column) and raises NotImplementedError.
+# Property 15: SheetsAdapter.get_records_since() is intentionally unsupported
+# for this demo (Tool 2 reads by header name) and raises NotImplementedError.
+# Note: scraped_at IS a required v1.1 column; the method is unsupported by
+# demo-scope decision, not because the column is absent.
 # Validates: Requirements 9.6
 # ---------------------------------------------------------------------------
 
 def test_property_15_get_records_since_unsupported_for_sheets():
-    """Property 15: get_records_since() is deprecated for the Live_Sheet_Schema
-    and raises NotImplementedError (there is no scraped_at column to filter on).
+    """Property 15: get_records_since() is intentionally unsupported for this
+    demo and raises NotImplementedError. Tool 2 reads rows by header name and
+    performs its own grouping/filtering (scraped_at IS a required v1.1 column;
+    the method is unsupported by demo-scope decision, not column absence).
 
     **Validates: Requirements 9.6**
     """
@@ -161,7 +165,7 @@ def test_missing_required_header_rejected():
     """A header row missing a required column is rejected."""
     adapter = _make_adapter()
     bad = list(SheetsAdapter.HEADERS)
-    bad.pop()  # drop 'review_status'
+    bad.pop()  # drop 'matched_keywords' (last v1.1 column)
     with pytest.raises(SheetsSchemaError):
         adapter._validate_headers(bad)
 

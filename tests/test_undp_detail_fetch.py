@@ -673,7 +673,7 @@ async def test_orchestration_end_to_end_keyword_after_1000():
 
     # description_snippet <= 1000 chars (it's stored as description_snippet in the record)
     desc_in_dict = record_dict.get("description_snippet") or record_dict.get("opportunity_title", "")
-    # Note: description_snippet may not be in the 12-column to_dict but check it doesn't exceed 1000
+    # Note: description_snippet is not projected to the Sheet, but verify it doesn't exceed 1000
     assert len(fake_opp["description_snippet"]) <= 1000
 
     # 3. _matching_text and _full_overview do NOT appear in serialized output
@@ -738,3 +738,105 @@ async def test_retry_after_numeric_respected():
 
     assert attempts[0] == 2
     assert len(results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# ORCHESTRATION REGRESSION TEST — orchestrator is authoritative for scraped_at
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_orchestrator_scraped_at_overrides_adapter_value():
+    """main.run_scraper() unconditionally stamps scraped_at with the orchestrator
+    time; an adapter-supplied (stale) value must not override it, and the
+    serialized value keeps the UTC 'Z' format.
+    """
+    from datetime import datetime, timezone
+    import main
+
+    # Adapter opportunity carries a deliberately STALE scraped_at.
+    stale = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 3, 4, 9, 15, 30, 500000, tzinfo=timezone.utc)
+
+    fake_opp = {
+        "opportunity_id": "undp-TS-OWNER",
+        "devex_opportunity_id": "undp-TS-OWNER",
+        "opportunity_title": "corruption governance program",
+        "funder_organisation": "UNDP",
+        "country_region": "Colombia",
+        "deadline": "2026-12-30",
+        "contract_value": None,
+        "opportunity_link": "https://procurement-notices.undp.org/view_notice.cfm?notice_id=owner",
+        "description_snippet": "corruption governance program details",
+        "source_portal": "undp",
+        "matched_keywords": [],
+        # Adapter-supplied stale discovery time that MUST be overridden.
+        "scraped_at": stale,
+    }
+
+    config = _make_config()
+    config.run_mode = "live"
+    config.store_type = "sheets"
+    config.anthropic_api_key = "test"
+    config.devex_enabled = False
+    config.undp_enabled = False
+    config.worldbank_enabled = False
+    config.usaid_enabled = False
+    config.iadb_enabled = False
+    config.oecd_enabled = False
+    config.samgov_enabled = False
+    config.perplexity_enabled = False
+
+    written_records = []
+    mock_store = MagicMock()
+    mock_store.test_connection.return_value = True
+    mock_store.get_all_links.return_value = set()
+    mock_store.write_record.side_effect = lambda r: written_records.append(r)
+
+    mock_audit = MagicMock()
+    mock_notifier = MagicMock()
+    mock_notifier.send_completion_summary = MagicMock()
+    mock_notifier.send_error_alert = MagicMock()
+
+    mock_interpreter = MagicMock()
+    mock_interpreter.interpret.return_value = {
+        "summary": "Test summary",
+        "relevance_score": "high",
+        "relevance_reason": "test",
+        "bid_recommendation": "pursue",
+        "risk_flags": None,
+        "llm_confidence": "high",
+    }
+
+    async def fake_registry(cfg):
+        class FakeAdapter:
+            portal_name = "undp"
+            async def fetch_opportunities(self):
+                return [fake_opp]
+        return [FakeAdapter()]
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    with patch("main.load_config", return_value=config), \
+         patch("main.SheetsAdapter", return_value=mock_store), \
+         patch("main.AirtableAdapter", return_value=mock_store), \
+         patch("main.AuditLogger", return_value=mock_audit), \
+         patch("main.Notifier", return_value=mock_notifier), \
+         patch("main.LLMInterpreter", return_value=mock_interpreter), \
+         patch("main.datetime", FixedDateTime), \
+         patch("main.build_adapter_registry", side_effect=fake_registry):
+        await main.run_scraper()
+
+    assert mock_store.write_record.call_count == 1
+    record = written_records[0]
+
+    # Orchestrator timestamp wins; adapter's stale value is ignored.
+    assert record.scraped_at == fixed_now
+    assert record.scraped_at != stale
+
+    # Serialized value keeps the UTC 'Z' format at full precision.
+    serialized = record.to_dict()["scraped_at"]
+    assert serialized == "2026-03-04T09:15:30.500000Z"
+    assert serialized.endswith("Z")

@@ -178,8 +178,11 @@ async def run_scraper():
             # Strip transient fields before serialization — they must not leak to Sheets
             merged.pop("_matching_text", None)
             merged.pop("_full_overview", None)
-            # Stamp discovery time as UTC (v1.1 schema contract)
-            merged.setdefault("scraped_at", datetime.now(timezone.utc))
+            # Orchestrator is authoritative for scraped_at: it always means when
+            # Tool 1 discovered/processed the opportunity. Unconditionally stamp
+            # it so an adapter-supplied value can never override the discovery
+            # time (v1.1 schema contract).
+            merged["scraped_at"] = datetime.now(timezone.utc)
             record = OpportunityRecord.from_dict(merged)
 
             if config.run_mode == "live":

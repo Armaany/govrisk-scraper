@@ -135,7 +135,7 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
 - [x] 7. Checkpoint — Ensure all adapter unit and property tests pass (satisfied: all adapter unit and property tests pass; 62/62 green property tests are intentionally absent and a pre-existing main baseline test fails)
   - Ensure all tests pass, ask the user if questions arise.
 
-- [x] 8. Update SheetsAdapter for the Live_Sheet_Schema, startup header validation, and ID-method deprecation (Option A / schema v1.0 — historical; superseded by Task 14 / schema v1.1)
+- [x] 8. Update SheetsAdapter for the Live_Sheet_Schema, startup header validation, and ID-method deprecation (Option A / schema v1.0) — **SUPERSEDED — kept for historical traceability** (see Task 14 / schema v1.1)
   - Preserve the exact frozen 12-column `HEADERS` (Live_Sheet_Schema) unchanged — do NOT append `source_portal`
   - Rewrite `write_record()` to explicitly project the canonical `to_dict()` payload onto the 12 external columns via `CANONICAL_KEY_FOR_COLUMN`, mapping canonical `source_portal` onto the external `portal_source` column (column 1); join `risk_flags` to a comma string; `None` -> ""
   - Add strict startup header validation (`_ensure_headers()`/`_validate_headers()`): initialize an empty sheet with the canonical header, else reject missing / duplicate (incl. whitespace/case) / reordered / unexpected headers via `SheetsSchemaError`; never auto-repair a populated header
@@ -240,6 +240,9 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
   - Unknown additional columns written as blank
   - Populated header rows never automatically rewritten
   - `scraped_at` = UTC discovery timestamp, ISO 8601 with Z suffix; naive datetimes rejected
+  - `scraped_at` ownership: the orchestrator (`main.run_scraper()`) unconditionally stamps it
+    (`merged["scraped_at"] = datetime.now(timezone.utc)`); an adapter-supplied value cannot
+    override the Tool 1 discovery time (Req 6.9). Backfill overrides need a future explicit mechanism.
   - `matched_keywords` = authoritative UTF-8 JSON array; Tool 2 displays without recomputation
   - Empty matches serialize as `[]`; historical blank values valid
   - Legacy 12-column header produces explicit migration error

@@ -734,8 +734,8 @@ is **never rewritten automatically**. The contract that governs serialization an
   microseconds). Canonical fields with no external column are not projected by
   `SheetsAdapter.write_record()`.
 - **Link-based cross-run dedup.** Cross-run deduplication is keyed on `opportunity_link`, seeded
-  from `SheetsAdapter.get_all_links()` (column 7), replacing the old `get_all_ids()`-on-column-1
-  approach.
+  from `SheetsAdapter.get_all_links()` (which resolves the `opportunity_link` column by
+  normalized header name), replacing the old `get_all_ids()`-on-column-1 approach.
 - **`get_records_since()` intentionally unsupported for this demo.** It raises
   `NotImplementedError`. Tool 2 reads rows by header name and performs its own
   grouping/filtering; it does not rely on `get_records_since()`. (This is a demo-scope decision,
@@ -764,6 +764,9 @@ For each opportunity that passes the filter, the orchestrator merges the LLM res
 merged = {**opp, **llm_result}
 merged.pop("_matching_text", None)   # transient — must not reach the store
 merged.pop("_full_overview", None)   # transient — must not reach the store
+# Orchestrator is authoritative for scraped_at: unconditional assignment so an
+# adapter-supplied value can never override the Tool 1 discovery time.
+merged["scraped_at"] = datetime.now(timezone.utc)
 record = OpportunityRecord.from_dict(merged)
 
 if config.run_mode == "live":
@@ -812,9 +815,13 @@ HEADERS = [
 ]
 ```
 
-`scraped_at` = discovery timestamp (when Tool 1 scraped the opportunity), distinct from
-`deadline` = opportunity submission deadline. `matched_keywords` = the authoritative
-per-opportunity keyword list; Tool 2 displays it without recomputation. Historical rows
+`scraped_at` = the Tool 1 discovery timestamp (when the orchestrator discovered/processed the
+opportunity). The **orchestrator is authoritative**: `main.run_scraper()` unconditionally stamps
+`scraped_at = datetime.now(timezone.utc)` for every processed opportunity, so an adapter-supplied
+value can never override it (historical/backfill overrides, if ever needed, require a future
+explicit mechanism). It is distinct from portal metadata and from `deadline` = opportunity
+submission deadline. `matched_keywords` = the authoritative per-opportunity keyword list; Tool 2
+displays it without recomputation. Historical rows
 may have blank `scraped_at`/`matched_keywords` values; this is valid.
 
 #### `write_record()` — header-name-driven projection (canonical → external columns)
@@ -866,15 +873,22 @@ in `to_dict()` for round-tripping, but are not written to the sheet.
 
 The former `get_all_ids()` read **column 1**, which under the Live_Sheet_Schema is
 `portal_source` (portal names such as `"devex"`), so it could not identify previously persisted
-opportunities; it is now deprecated and raises `NotImplementedError`. Add a `get_all_links()` method that reads the **`opportunity_link` column
-(column 7)** and returns the set of persisted links. The orchestrator seeds its cross-run dedup
-set from these links (Req 6.8) and dedups across runs by `opportunity_link` (Req 10.5).
+opportunities; it is now deprecated and raises `NotImplementedError`. Add a `get_all_links()`
+method that locates the `opportunity_link` column **by its normalized header name** (schema v1.1
+accepts reordered headers, so the position is not fixed) and returns the set of persisted links.
+The orchestrator seeds its cross-run dedup set from these links (Req 6.8) and dedups across runs
+by `opportunity_link` (Req 10.5).
 
 ```python
 def get_all_links(self) -> set[str]:
-    """Return the set of persisted opportunity_link values (column 7, excluding header)."""
+    """Return the set of persisted opportunity_link values.
+
+    Resolves the opportunity_link column by header name (not a fixed index),
+    so a reordered v1.1 header still reads the correct column.
+    """
     try:
-        link_column = self.worksheet.col_values(7)  # opportunity_link
+        index = self._header_index["opportunity_link"]  # resolved from live header
+        link_column = self.worksheet.col_values(index + 1)
     except Exception:
         return set()
     if len(link_column) <= 1:
@@ -941,11 +955,12 @@ For Airtable, `get_records_since()` keeps the legacy default (Req 9.7): records 
 fields.setdefault("source_portal", "devex")
 ```
 
-**Deduplication under Option A (both stores).** Cross-run deduplication is keyed on
-`opportunity_link`, not on any stored ID column. For `SheetsAdapter` the orchestrator seeds from
-`get_all_links()` (column 7 of the Live_Sheet_Schema); the old `get_all_ids()`-on-column-1 path
-is not used, because column 1 holds `portal_source` (portal names) under the frozen schema. The
-Sheet is **not** migrated and no `devex_opportunity_id` or `scraped_at` column is added.
+**Deduplication (both stores).** Cross-run deduplication is keyed on `opportunity_link`, not on
+any stored ID column. For `SheetsAdapter` the orchestrator seeds from `get_all_links()`, which
+resolves the `opportunity_link` column by header name; the old `get_all_ids()`-on-column-1 path
+is not used, because column 1 holds `portal_source` (portal names). Under schema v1.1 the
+Live_Sheet_Schema is the 14-column set (including `scraped_at` and `matched_keywords`); no
+`devex_opportunity_id` column is used for dedup.
 
 ---
 
@@ -963,7 +978,7 @@ Sheet is **not** migrated and no `devex_opportunity_id` or `scraped_at` column i
 - Perplexity: no stable ID exists in free-text responses; deterministic hash of the URL
   provides stable, reproducible IDs across runs
 
-Deduplication under Option A: **cross-run** dedup is keyed on `opportunity_link` (seeded from
+Deduplication: **cross-run** dedup is keyed on `opportunity_link` (seeded from
 `store.get_all_links()`), because the Live_Sheet_Schema persists no `opportunity_id` column
 (Req 10.5). **Within a single run**, the orchestrator additionally skips a repeated
 `opportunity_id` as well as a repeated `opportunity_link` (Req 10.4), so two adapters surfacing
@@ -1173,11 +1188,13 @@ UTC ISO 8601 with a `Z` suffix and `matched_keywords` as a UTF-8 JSON array. `HE
 ### Property 15: get_all_links seeds link-based cross-run dedup; get_records_since is deprecated for Sheets
 
 *For any* set of rows persisted under the Live_Sheet_Schema, `SheetsAdapter.get_all_links()` must
-return exactly the set of non-empty values in the `opportunity_link` column (column 7, excluding
-the header), and seeding the orchestrator's cross-run dedup from that set must cause any incoming
-`Opportunity_Dict` whose `opportunity_link` is already persisted to be skipped. Under the
-Live_Sheet_Schema, `SheetsAdapter.get_records_since()` must be unsupported — raising `NotImplementedError` by contract (matching the implementation). For `AirtableAdapter`, any stored record lacking a
-`source_portal` field must still default to `"devex"`.
+return exactly the set of non-empty values in the `opportunity_link` column (resolved by
+normalized header name, excluding the header row), and seeding the orchestrator's cross-run dedup
+from that set must cause any incoming `Opportunity_Dict` whose `opportunity_link` is already
+persisted to be skipped. `SheetsAdapter.get_records_since()` must be intentionally unsupported
+for this demo — raising `NotImplementedError` (Tool 2 reads by header name and does its own
+grouping/filtering). For `AirtableAdapter`, any stored record lacking a `source_portal` field
+must still default to `"devex"`.
 
 **Validates: Requirements 6.8, 9.6, 9.7, 10.5**
 

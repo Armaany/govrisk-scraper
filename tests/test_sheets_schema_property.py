@@ -144,7 +144,7 @@ def test_headers_is_schema_v11_14_column():
 # ---------------------------------------------------------------------------
 # Property 14: SheetsAdapter maps source_portal onto the portal_source column.
 #
-# For arbitrary OpportunityRecords, _project_row(record) is exactly 12 wide, the
+# For arbitrary OpportunityRecords, _project_row(record) is exactly 14 wide, the
 # value at HEADERS.index("portal_source") (== 0) equals record.source_portal,
 # and each remaining column equals its canonical counterpart from
 # record.to_dict() (risk_flags joined into a comma string, None -> "").
