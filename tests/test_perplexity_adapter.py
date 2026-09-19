@@ -10,6 +10,13 @@ from hypothesis import strategies as st
 
 from config import Config
 from portals.perplexity_adapter import PerplexityAdapter, _deterministic_hash
+from portals.errors import (
+    CATEGORY_HTTP_STATUS,
+    CATEGORY_RESPONSE_PARSE,
+    OP_LISTING_FETCH,
+    OP_RESPONSE_PARSE,
+    PortalFetchError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +94,9 @@ async def test_disabled_returns_empty_without_http():
 
 
 @pytest.mark.asyncio
-async def test_http_error_returns_empty_and_logs():
-    """When Perplexity returns HTTP 4xx, fetch_opportunities returns [] and logs the error."""
+async def test_http_error_raises_typed_error_and_logs():
+    """When Perplexity returns HTTP 4xx, fetch_opportunities raises a typed
+    PortalFetchError (http_status) and logs the error."""
     config = make_config()
     adapter = PerplexityAdapter(config)
 
@@ -99,15 +107,21 @@ async def test_http_error_returns_empty_and_logs():
         patch("portals.perplexity_adapter.httpx.AsyncClient", return_value=mock_client),
         patch.object(adapter, "_log_http_error") as mock_log,
     ):
-        result = await adapter.fetch_opportunities()
+        with pytest.raises(PortalFetchError) as excinfo:
+            await adapter.fetch_opportunities()
 
-    assert result == []
+    err = excinfo.value
+    assert err.portal == "Perplexity"
+    assert err.operation == OP_LISTING_FETCH
+    assert err.category == CATEGORY_HTTP_STATUS
+    assert err.http_status == 401
     mock_log.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_unparseable_json_returns_empty_and_logs():
-    """When the response content is not valid JSON, returns [] and logs parse error."""
+async def test_unparseable_json_raises_typed_error_and_logs():
+    """When the response content is not valid JSON, fetch_opportunities raises a
+    typed PortalFetchError (response_parse) and logs the parse error."""
     config = make_config()
     adapter = PerplexityAdapter(config)
 
@@ -118,9 +132,13 @@ async def test_unparseable_json_returns_empty_and_logs():
         patch("portals.perplexity_adapter.httpx.AsyncClient", return_value=mock_client),
         patch.object(adapter, "_log_parse_error") as mock_log,
     ):
-        result = await adapter.fetch_opportunities()
+        with pytest.raises(PortalFetchError) as excinfo:
+            await adapter.fetch_opportunities()
 
-    assert result == []
+    err = excinfo.value
+    assert err.portal == "Perplexity"
+    assert err.operation == OP_RESPONSE_PARSE
+    assert err.category == CATEGORY_RESPONSE_PARSE
     mock_log.assert_called_once()
 
 

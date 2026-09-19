@@ -20,7 +20,17 @@ import httpx
 from bs4 import BeautifulSoup
 
 from engine.keyword_filter import MATCHING_TEXT_KEY, KeywordFilter
-from portals.base_adapter import BasePortalAdapter
+from portals.base_adapter import (
+    CATEGORY_CONNECTION,
+    CATEGORY_HTTP_STATUS,
+    CATEGORY_RESPONSE_PARSE,
+    CATEGORY_TIMEOUT,
+    OP_LISTING_FETCH,
+    OP_RESPONSE_PARSE,
+    BasePortalAdapter,
+    PortalFetchError,
+    _safe_cause_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +43,24 @@ _MAX_CONCURRENT_DETAIL_FETCHES = 8
 _DETAIL_REQUEST_TIMEOUT = 12  # seconds per individual request attempt
 _DETAIL_ENRICHMENT_DEADLINE = 120  # seconds — detail enrichment phase must complete within this
 
-# Retry settings — only for transient failures
+# Retry settings — DETAIL pages only (unchanged; do not repurpose for listing)
 _MAX_ATTEMPTS = 3
 _BASE_BACKOFF = 0.5  # seconds — multiplied by 2^attempt with jitter
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _PERMANENT_FAIL_STATUS_CODES = {400, 401, 403, 404}
+
+# Retry settings — LISTING page only. These are intentionally separate from the
+# detail-page constants above so listing retry mechanics can evolve without
+# touching detail-page concurrency, its semaphore, its per-request timeout, or
+# the 120s enrichment deadline.
+_LISTING_MAX_ATTEMPTS = 3          # total attempts (initial + up to 2 retries)
+_LISTING_REQUEST_TIMEOUT = 20      # seconds per individual listing attempt
+_LISTING_PHASE_DEADLINE = 75       # seconds — whole listing phase must finish within this
+_LISTING_BACKOFF_SCHEDULE = (1.0, 2.0)  # backoff before retry #1, retry #2
+_LISTING_JITTER_MAX = 0.25         # seconds — added uniformly to each backoff
+_LISTING_MAX_RETRY_SLEEP = 10      # seconds — hard cap on any sleep incl. Retry-After
+# Retryable listing conditions: transient network errors + these status codes.
+_LISTING_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Display/storage truncation (NOT used for keyword matching)
 _DESCRIPTION_DISPLAY_MAX = 1000
@@ -164,23 +187,27 @@ class UNDPAdapter(BasePortalAdapter):
             timeout=httpx.Timeout(_DETAIL_REQUEST_TIMEOUT, connect=10),
             headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
-            # Fetch listing page
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
-                self._log_error(exc, detail="listing page fetch failed")
-                print(f"[UNDP] ERROR: listing fetch failed — {exc}")
-                return []
+            # Fetch listing page with bounded retry (raises PortalFetchError on
+            # exhausted attempts / deadline). Never holds the detail semaphore.
+            listing_html = await self._fetch_listing_with_retry(client, url)
 
-            print(f"[UNDP] Listing size: {len(resp.text)} chars")
-            soup = BeautifulSoup(resp.text, "lxml")
+            print(f"[UNDP] Listing size: {len(listing_html)} chars")
+            soup = BeautifulSoup(listing_html, "lxml")
 
             table = soup.find("div", class_="vacanciesTable")
             if not table:
+                # HTTP succeeded but the expected structure is missing — this is
+                # a whole-response parse failure, not an empty result set.
                 print("[UNDP] ERROR: div.vacanciesTable not found")
-                return []
+                raise PortalFetchError(
+                    "UNDP",
+                    OP_RESPONSE_PARSE,
+                    CATEGORY_RESPONSE_PARSE,
+                    attempts=1,
+                    reason="listing table missing",
+                )
 
+            # Table present. Zero cards is a legitimate empty result → [].
             all_cards = table.find_all("a", class_="vacanciesTable__row")
             latam_cards = [c for c in all_cards if _LATAM_REGION_CLASS in (c.get("class") or [])]
             cards_to_parse = latam_cards if latam_cards else all_cards
@@ -231,9 +258,14 @@ class UNDPAdapter(BasePortalAdapter):
             # Create tasks and wait with timeout
             tasks = [asyncio.create_task(enrich_one(opp)) for opp in active_cards]
 
-            # Wait for all tasks but respect the adapter deadline
-            remaining_time = max(0, deadline - asyncio.get_event_loop().time())
-            done, pending = await asyncio.wait(tasks, timeout=remaining_time)
+            # No active cards → nothing to enrich. A present listing table with
+            # zero (or only expired) cards is a legitimate empty result set.
+            if not tasks:
+                done, pending = set(), set()
+            else:
+                # Wait for all tasks but respect the adapter deadline
+                remaining_time = max(0, deadline - asyncio.get_event_loop().time())
+                done, pending = await asyncio.wait(tasks, timeout=remaining_time)
 
             # Cancel and await pending tasks cleanly
             cancelled_count = 0
@@ -271,6 +303,158 @@ class UNDPAdapter(BasePortalAdapter):
             print(f"[UNDP] Sample: {filtered[0].get('opportunity_title', '')[:70]}")
 
         return filtered[: self.config.max_results]
+
+    async def _fetch_listing_with_retry(
+        self, client: httpx.AsyncClient, url: str
+    ) -> str:
+        """Fetch the UNDP listing page with a bounded, deadline-aware retry.
+
+        Policy (listing only — independent of detail-page mechanics):
+        - Up to ``_LISTING_MAX_ATTEMPTS`` (3) total attempts.
+        - Each request is given ``_LISTING_REQUEST_TIMEOUT`` (20s), clamped to
+          the remaining phase budget.
+        - The whole phase must finish within ``_LISTING_PHASE_DEADLINE`` (75s).
+        - Retry only on transient network errors (timeout / connection) and on
+          HTTP 429 / 5xx. Other 4xx are non-retryable and fail immediately.
+        - Backoff is 1s then 2s plus 0–0.25s jitter; ``Retry-After`` (numeric or
+          HTTP-date) is honoured. Every sleep is capped at 10s AND clamped to
+          the remaining budget.
+        - Reuses the shared client and NEVER acquires the detail semaphore.
+
+        Returns the listing HTML text, or raises a credential-safe
+        ``PortalFetchError`` on exhausted attempts / deadline.
+        """
+        loop = asyncio.get_event_loop()
+        phase_deadline = loop.time() + _LISTING_PHASE_DEADLINE
+        last_status: Optional[int] = None
+        last_transient: Optional[Exception] = None
+
+        for attempt in range(1, _LISTING_MAX_ATTEMPTS + 1):
+            remaining = phase_deadline - loop.time()
+            if remaining <= 0:
+                break
+
+            request_timeout = min(_LISTING_REQUEST_TIMEOUT, remaining)
+            try:
+                resp = await client.get(
+                    url, timeout=httpx.Timeout(request_timeout, connect=min(10, request_timeout))
+                )
+            except httpx.TimeoutException as exc:
+                last_transient = exc
+                last_status = None
+                if not await self._listing_sleep_before_retry(
+                    attempt, phase_deadline, retry_after=None
+                ):
+                    break
+                continue
+            except httpx.RequestError as exc:
+                # Connection/network errors are transient and retryable.
+                last_transient = exc
+                last_status = None
+                if not await self._listing_sleep_before_retry(
+                    attempt, phase_deadline, retry_after=None
+                ):
+                    break
+                continue
+
+            status = resp.status_code
+
+            # Non-retryable 4xx (and any other non-2xx not in the retry set):
+            # fail immediately with exactly this one attempt counted.
+            if status >= 400 and status not in _LISTING_RETRYABLE_STATUS_CODES:
+                self._log_error(
+                    Exception(f"HTTP {status}"), detail="listing fetch non-retryable status"
+                )
+                raise PortalFetchError(
+                    "UNDP",
+                    OP_LISTING_FETCH,
+                    CATEGORY_HTTP_STATUS,
+                    attempts=attempt,
+                    http_status=status,
+                    reason="non-retryable",
+                )
+
+            # Retryable status (429 / 5xx): respect Retry-After, then retry.
+            if status in _LISTING_RETRYABLE_STATUS_CODES:
+                last_status = status
+                last_transient = None
+                retry_after = resp.headers.get("Retry-After", "")
+                if not await self._listing_sleep_before_retry(
+                    attempt, phase_deadline, retry_after=retry_after
+                ):
+                    break
+                continue
+
+            # Success (2xx / 3xx handled by httpx). Return the body text.
+            return resp.text
+
+        # Exhausted attempts or ran out of budget. Build a credential-safe error
+        # reflecting the last observed failure mode.
+        attempts_used = min(attempt, _LISTING_MAX_ATTEMPTS)
+        if last_status is not None:
+            raise PortalFetchError(
+                "UNDP",
+                OP_LISTING_FETCH,
+                CATEGORY_HTTP_STATUS,
+                attempts=attempts_used,
+                http_status=last_status,
+            )
+        if isinstance(last_transient, httpx.TimeoutException):
+            raise PortalFetchError(
+                "UNDP",
+                OP_LISTING_FETCH,
+                CATEGORY_TIMEOUT,
+                attempts=attempts_used,
+                reason=_safe_cause_label(last_transient),
+            )
+        raise PortalFetchError(
+            "UNDP",
+            OP_LISTING_FETCH,
+            CATEGORY_CONNECTION,
+            attempts=attempts_used,
+            reason=_safe_cause_label(last_transient) if last_transient else "deadline exceeded",
+        )
+
+    def _listing_compute_backoff(self, attempt: int, retry_after: Optional[str],
+                                 remaining: float) -> float:
+        """Compute the listing retry sleep for a given attempt.
+
+        Uses ``Retry-After`` when present/parseable; otherwise the fixed backoff
+        schedule (1s, 2s) plus jitter. The result is capped at
+        ``_LISTING_MAX_RETRY_SLEEP`` (10s) and clamped to ``remaining`` budget.
+        """
+        wait = 0.0
+        if retry_after:
+            wait = _parse_retry_after(retry_after, _LISTING_MAX_RETRY_SLEEP)
+        if wait <= 0:
+            # Backoff schedule is indexed by the just-completed attempt number.
+            idx = min(attempt - 1, len(_LISTING_BACKOFF_SCHEDULE) - 1)
+            wait = _LISTING_BACKOFF_SCHEDULE[idx] + random.uniform(0, _LISTING_JITTER_MAX)
+        wait = min(wait, _LISTING_MAX_RETRY_SLEEP)
+        wait = min(wait, remaining)
+        return max(wait, 0.0)
+
+    async def _listing_sleep_before_retry(self, attempt: int, phase_deadline: float,
+                                          retry_after: Optional[str]) -> bool:
+        """Sleep before the next listing attempt, honouring the phase deadline.
+
+        Returns True if another attempt should be made, False if attempts are
+        exhausted or the deadline leaves no room. The detail semaphore is never
+        involved here.
+        """
+        if attempt >= _LISTING_MAX_ATTEMPTS:
+            return False
+        loop = asyncio.get_event_loop()
+        remaining = phase_deadline - loop.time()
+        if remaining <= 0:
+            return False
+        wait = self._listing_compute_backoff(attempt, retry_after, remaining)
+        if wait >= remaining:
+            # Not enough budget to sleep and still make a real attempt.
+            return False
+        if wait > 0:
+            await asyncio.sleep(wait)
+        return True
 
     async def _fetch_detail_with_retry(
         self, client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore,

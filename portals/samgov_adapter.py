@@ -5,7 +5,17 @@ from datetime import datetime, timedelta
 import httpx
 
 from config import Config
-from portals.base_adapter import BasePortalAdapter
+from portals.base_adapter import (
+    CATEGORY_CONNECTION,
+    CATEGORY_HTTP_STATUS,
+    CATEGORY_RESPONSE_PARSE,
+    CATEGORY_TIMEOUT,
+    OP_LISTING_FETCH,
+    OP_RESPONSE_PARSE,
+    BasePortalAdapter,
+    PortalFetchError,
+    _safe_cause_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +49,46 @@ class SAMGovAdapter(BasePortalAdapter):
                 response = await client.get(self.BASE_URL, params=params)
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
+                # Logs status + sanitized URL only (never the api_key query string).
                 self._log_http_error(exc)
-                return []
+                raise PortalFetchError(
+                    "SAM.gov",
+                    OP_LISTING_FETCH,
+                    CATEGORY_HTTP_STATUS,
+                    attempts=1,
+                    http_status=exc.response.status_code,
+                ) from exc
+            except httpx.TimeoutException as exc:
+                self._log_error(exc, detail="listing fetch timed out")
+                raise PortalFetchError(
+                    "SAM.gov",
+                    OP_LISTING_FETCH,
+                    CATEGORY_TIMEOUT,
+                    attempts=1,
+                    reason=_safe_cause_label(exc),
+                ) from exc
+            except httpx.RequestError as exc:
+                self._log_error(exc, detail="listing fetch failed")
+                raise PortalFetchError(
+                    "SAM.gov",
+                    OP_LISTING_FETCH,
+                    CATEGORY_CONNECTION,
+                    attempts=1,
+                    reason=_safe_cause_label(exc),
+                ) from exc
 
-        raw_items = response.json().get("opportunitiesData", [])
+        try:
+            raw_items = response.json().get("opportunitiesData", [])
+        except Exception as exc:
+            self._log_parse_error(exc)
+            raise PortalFetchError(
+                "SAM.gov",
+                OP_RESPONSE_PARSE,
+                CATEGORY_RESPONSE_PARSE,
+                attempts=1,
+                reason=_safe_cause_label(exc),
+            ) from exc
+
         latam_items = [item for item in raw_items if self._is_latam_relevant(item)]
         return [self._map_result(item) for item in latam_items]
 

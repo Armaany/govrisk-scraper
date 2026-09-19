@@ -28,7 +28,14 @@ import requests
 from dateutil import parser as date_parser
 
 from engine.keyword_filter import KeywordFilter
-from portals.base_adapter import BasePortalAdapter
+from portals.base_adapter import (
+    CATEGORY_RESPONSE_PARSE,
+    OP_RESPONSE_PARSE,
+    BasePortalAdapter,
+    PortalFetchError,
+    _safe_cause_label,
+    classify_requests_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +158,21 @@ class WorldBankAdapter(BasePortalAdapter):
         try:
             r = requests.get(url, timeout=15, headers=HEADERS)
             r.raise_for_status()
-            data = r.json()
         except Exception as exc:
             self._log_error(exc, detail="keyword query failed")
-            print(f"[WorldBank] ERROR: {exc}")
-            return []
+            raise classify_requests_error("World Bank", exc) from exc
+
+        try:
+            data = r.json()
+        except Exception as exc:
+            self._log_parse_error(exc)
+            raise PortalFetchError(
+                "World Bank",
+                OP_RESPONSE_PARSE,
+                CATEGORY_RESPONSE_PARSE,
+                attempts=1,
+                reason=_safe_cause_label(exc),
+            ) from exc
 
         notices = data.get("procnotices", [])
         if isinstance(notices, dict):

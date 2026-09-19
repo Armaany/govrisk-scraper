@@ -98,7 +98,7 @@ def test_property_1_samgov_result_fields_complete(notice_ids, country):
     mock_client.get = AsyncMock(return_value=mock_response)
 
     with patch("portals.samgov_adapter.httpx.AsyncClient", return_value=mock_client):
-        results = asyncio.get_event_loop().run_until_complete(adapter.fetch_opportunities())
+        results = asyncio.run(adapter.fetch_opportunities())
 
     assert len(results) == len(notice_ids)
     for opp in results:
@@ -153,7 +153,7 @@ def test_property_1_perplexity_result_fields_complete(links):
     mock_client.post = AsyncMock(return_value=mock_response)
 
     with patch("portals.perplexity_adapter.httpx.AsyncClient", return_value=mock_client):
-        results = asyncio.get_event_loop().run_until_complete(adapter.fetch_opportunities())
+        results = asyncio.run(adapter.fetch_opportunities())
 
     assert len(results) == len(links)
     for opp in results:

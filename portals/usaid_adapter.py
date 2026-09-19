@@ -19,7 +19,14 @@ import requests
 from dateutil import parser as date_parser
 
 from engine.keyword_filter import KeywordFilter
-from portals.base_adapter import BasePortalAdapter
+from portals.base_adapter import (
+    CATEGORY_RESPONSE_PARSE,
+    OP_RESPONSE_PARSE,
+    BasePortalAdapter,
+    PortalFetchError,
+    _safe_cause_label,
+    classify_requests_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +119,21 @@ class USAIDAdapter(BasePortalAdapter):
         try:
             r = requests.post(API_URL, json=payload, timeout=15, headers=HEADERS)
             r.raise_for_status()
-            data = r.json()
         except Exception as exc:
             self._log_error(exc, detail="grants.gov query failed")
-            print(f"[USAID/Grants] ERROR: {exc}")
-            return []
+            raise classify_requests_error("Grants.gov", exc) from exc
+
+        try:
+            data = r.json()
+        except Exception as exc:
+            self._log_parse_error(exc)
+            raise PortalFetchError(
+                "Grants.gov",
+                OP_RESPONSE_PARSE,
+                CATEGORY_RESPONSE_PARSE,
+                attempts=1,
+                reason=_safe_cause_label(exc),
+            ) from exc
 
         hits = data.get("oppHits", [])
         total = data.get("hitCount", "?")

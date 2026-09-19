@@ -5,6 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from config import Config
 from portals.devex_adapter import DevexAdapter
 from portals.devex_auth import AuthenticationError
+from portals.errors import (
+    CATEGORY_AUTHENTICATION,
+    OP_AUTHENTICATION,
+    PortalFetchError,
+)
 
 
 def make_config() -> Config:
@@ -23,35 +28,43 @@ def make_config() -> Config:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_auth_error_returns_empty_list():
-    """When DevexAuth.load_session raises AuthenticationError, fetch_opportunities returns []."""
+async def test_auth_error_raises_typed_error_without_adapter_alert():
+    """AuthenticationError becomes a credential-safe PortalFetchError.
+
+    The adapter no longer sends its own audit/notifier alert (the orchestrator
+    owns alerting). The typed error carries the authentication category and the
+    remediation phrase, but never the configured email/password.
+    """
     config = make_config()
     adapter = DevexAdapter(config)
 
     mock_auth = AsyncMock()
-    mock_auth.load_session.side_effect = AuthenticationError("login failed")
+    # Sentinel-bearing raw message: the actual password must not leak into str().
+    mock_auth.load_session.side_effect = AuthenticationError(
+        "login failed for test@example.com / password"
+    )
     mock_auth.close = AsyncMock()
 
-    with (
-        patch("portals.devex_adapter.DevexAuth", return_value=mock_auth),
-        patch("portals.devex_adapter.AuditLogger") as mock_audit_cls,
-        patch("portals.devex_adapter.Notifier") as mock_notifier_cls,
-    ):
-        mock_audit = MagicMock()
-        mock_audit_cls.return_value = mock_audit
-        mock_notifier = MagicMock()
-        mock_notifier_cls.return_value = mock_notifier
+    with patch("portals.devex_adapter.DevexAuth", return_value=mock_auth):
+        with pytest.raises(PortalFetchError) as excinfo:
+            await adapter.fetch_opportunities()
 
-        result = await adapter.fetch_opportunities()
-
-    assert result == []
-    mock_audit.log_error.assert_called_once()
-    mock_notifier.send_error_alert.assert_called_once()
+    err = excinfo.value
+    assert err.portal == "Devex"
+    assert err.operation == OP_AUTHENTICATION
+    assert err.category == CATEGORY_AUTHENTICATION
+    assert err.attempts == 1
+    # Remediation preserved, secrets absent.
+    assert "check DEVEX_EMAIL and DEVEX_PASSWORD" in str(err)
+    assert "password" not in str(err)
+    assert "test@example.com" not in str(err)
+    # Original cause preserved for debugging via chaining.
+    assert isinstance(err.__cause__, AuthenticationError)
 
 
 @pytest.mark.asyncio
 async def test_auth_error_still_closes_playwright():
-    """auth.close() is called even when AuthenticationError is raised."""
+    """auth.close() is called even when the typed error is raised."""
     config = make_config()
     adapter = DevexAdapter(config)
 
@@ -59,12 +72,9 @@ async def test_auth_error_still_closes_playwright():
     mock_auth.load_session.side_effect = AuthenticationError("login failed")
     mock_auth.close = AsyncMock()
 
-    with (
-        patch("portals.devex_adapter.DevexAuth", return_value=mock_auth),
-        patch("portals.devex_adapter.AuditLogger"),
-        patch("portals.devex_adapter.Notifier"),
-    ):
-        await adapter.fetch_opportunities()
+    with patch("portals.devex_adapter.DevexAuth", return_value=mock_auth):
+        with pytest.raises(PortalFetchError):
+            await adapter.fetch_opportunities()
 
     mock_auth.close.assert_awaited_once()
 
@@ -149,7 +159,8 @@ async def test_finally_close_called_on_success():
 
 @pytest.mark.asyncio
 async def test_finally_close_called_when_search_raises():
-    """auth.close() is called even when collect_opportunity_urls raises an unexpected error."""
+    """A listing/search fetch failure raises a typed PortalFetchError and still
+    closes Playwright. The raw cause message must not leak into str()."""
     config = make_config()
     adapter = DevexAdapter(config)
 
@@ -158,7 +169,9 @@ async def test_finally_close_called_when_search_raises():
     mock_auth.close = AsyncMock()
 
     mock_search = AsyncMock()
-    mock_search.collect_opportunity_urls = AsyncMock(side_effect=RuntimeError("network error"))
+    mock_search.collect_opportunity_urls = AsyncMock(
+        side_effect=RuntimeError("network error https://devex.com/api?token=SECRET")
+    )
 
     mock_parser = AsyncMock()
 
@@ -167,7 +180,15 @@ async def test_finally_close_called_when_search_raises():
         patch("portals.devex_adapter.DevexSearch", return_value=mock_search),
         patch("portals.devex_adapter.DevexParser", return_value=mock_parser),
     ):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(PortalFetchError) as excinfo:
             await adapter.fetch_opportunities()
 
+    err = excinfo.value
+    assert err.portal == "Devex"
+    assert err.operation == "listing_fetch"
+    # Only the safe cause label (class name) appears; secrets do not.
+    assert "RuntimeError" in str(err)
+    assert "SECRET" not in str(err)
+    assert "token" not in str(err)
+    assert isinstance(err.__cause__, RuntimeError)
     mock_auth.close.assert_awaited_once()

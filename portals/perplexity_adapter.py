@@ -6,7 +6,17 @@ import re
 
 import httpx
 
-from portals.base_adapter import BasePortalAdapter
+from portals.base_adapter import (
+    CATEGORY_CONNECTION,
+    CATEGORY_HTTP_STATUS,
+    CATEGORY_RESPONSE_PARSE,
+    CATEGORY_TIMEOUT,
+    OP_LISTING_FETCH,
+    OP_RESPONSE_PARSE,
+    BasePortalAdapter,
+    PortalFetchError,
+    _safe_cause_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +53,33 @@ class PerplexityAdapter(BasePortalAdapter):
                 response = await client.post(PERPLEXITY_API_URL, json=payload, headers=headers)
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
+                # Logs status + sanitized URL only; never the Authorization header.
                 self._log_http_error(exc)
-                return []
+                raise PortalFetchError(
+                    "Perplexity",
+                    OP_LISTING_FETCH,
+                    CATEGORY_HTTP_STATUS,
+                    attempts=1,
+                    http_status=exc.response.status_code,
+                ) from exc
+            except httpx.TimeoutException as exc:
+                self._log_error(exc, detail="request timed out")
+                raise PortalFetchError(
+                    "Perplexity",
+                    OP_LISTING_FETCH,
+                    CATEGORY_TIMEOUT,
+                    attempts=1,
+                    reason=_safe_cause_label(exc),
+                ) from exc
+            except httpx.RequestError as exc:
+                self._log_error(exc, detail="request failed")
+                raise PortalFetchError(
+                    "Perplexity",
+                    OP_LISTING_FETCH,
+                    CATEGORY_CONNECTION,
+                    attempts=1,
+                    reason=_safe_cause_label(exc),
+                ) from exc
 
         return self._parse_response(response.json())
 
@@ -88,4 +123,10 @@ class PerplexityAdapter(BasePortalAdapter):
             return results
         except Exception as exc:
             self._log_parse_error(exc)
-            return []
+            raise PortalFetchError(
+                "Perplexity",
+                OP_RESPONSE_PARSE,
+                CATEGORY_RESPONSE_PARSE,
+                attempts=1,
+                reason=_safe_cause_label(exc),
+            ) from exc

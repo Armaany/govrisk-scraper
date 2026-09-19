@@ -158,6 +158,14 @@ class DevexAdapter(BasePortalAdapter):
             parser = DevexParser(self.config, page)
             urls = await search.collect_opportunity_urls()
             results = []
+            try:
+                page = await auth.load_session()
+            except AuthenticationError as exc:
+                self._log_auth_error(exc)
+                raise PortalFetchError("Devex", "authentication", "authentication",
+                                       attempts=1,
+                                       reason="check DEVEX_EMAIL and DEVEX_PASSWORD") from exc
+            ...
             for url in urls:
                 try:
                     parsed = await parser.parse_opportunity(url)
@@ -165,19 +173,20 @@ class DevexAdapter(BasePortalAdapter):
                     parsed["source_portal"] = "devex"
                     results.append(parsed)
                 except Exception as exc:
-                    self._log_and_continue(exc, url)
+                    self._log_and_continue(exc, url)  # per-URL: partial results
             return results
-        except AuthenticationError as exc:
-            self._log_auth_error(exc)
-            return []
         finally:
             await auth.close()
 ```
 
 **Error handling:**
-- `AuthenticationError` → log via `AuditLogger`, alert via `Notifier`, return `[]`
-- Per-URL parse failure → log and continue; partial results returned
-- All Playwright resources closed in `finally` block unconditionally
+- `AuthenticationError` → log via `_log_auth_error`, then raise a credential-safe
+  `PortalFetchError` (operation `authentication`) preserving the
+  `check DEVEX_EMAIL and DEVEX_PASSWORD` remediation; the adapter no longer sends its own
+  `AuditLogger`/`Notifier` alert (the orchestrator owns alerting).
+- Whole-adapter listing/search failure → raise `PortalFetchError` (operation `listing_fetch`).
+- Per-URL parse failure → log and continue; partial results returned.
+- All Playwright resources closed in `finally` block unconditionally.
 
 ---
 
@@ -976,16 +985,53 @@ the same opportunity are collapsed by either key.
 
 | Scenario | Adapter behaviour | Orchestrator behaviour |
 |---|---|---|
-| `AuthenticationError` (Devex) | Log + alert + return `[]` | Continues to next adapter |
+| `AuthenticationError` (Devex) | Log + raise `PortalFetchError` (authentication); no adapter alert; close Playwright | Catch typed error; `errors+=1`; one alert `component="devex"`; continue |
 | Per-URL parse failure (Devex) | Log + continue loop | Partial results returned |
-| HTTP 4xx/5xx (SAM.gov, Perplexity) | Log + return `[]` | Continues to next adapter |
-| Unparseable JSON (Perplexity) | Log + return `[]` | Continues to next adapter |
+| HTTP 4xx/5xx (SAM.gov, Perplexity) | Log (sanitized) + raise `PortalFetchError` (http_status) | Catch; `errors+=1`; one alert; continue |
+| Timeout / connection (SAM.gov, Perplexity, WB, Grants.gov) | Log + raise `PortalFetchError` (timeout/connection) | Catch; `errors+=1`; one alert; continue |
+| Unparseable whole response (Perplexity, WB, Grants.gov, SAM.gov) | Log + raise `PortalFetchError` (response_parse) | Catch; `errors+=1`; one alert; continue |
+| UNDP listing exhausted / deadline | Raise `PortalFetchError` (listing_fetch) | Catch; `errors+=1`; one alert `component="undp"`; continue |
+| UNDP listing table missing | Raise `PortalFetchError` (response_parse) | Catch; `errors+=1`; one alert; continue |
+| Genuine empty result (any adapter) | Return `[]` | No error; continue |
+| IADB / OECD blocked | `adapter_blocked` audit event; return `[]` | No error; continue |
 | Adapter raises unhandled exception | Propagates up | Caught at loop level; log + alert + continue |
 | `StoreWriteError` | N/A | Log + increment error counter; continue |
 | `load_config()` validation failure | N/A | Raises `ValueError` before any adapter runs |
 
-All adapter-level errors are non-fatal to the run. The orchestrator always completes the
-`finally` block (audit log + notification) regardless of how many adapters fail.
+`[]` means a successful fetch with no opportunities. Whole-adapter fetch, authentication, and
+whole-response parse failures raise a credential-safe `PortalFetchError`; per-record parsing
+may still yield partial results where documented. The orchestrator owns alerting and error
+counting (exactly one alert per failing adapter). IADB/OECD remain intentional `adapter_blocked`
+exclusions. All adapter-level errors are non-fatal to the run; the orchestrator always completes
+the `finally` block (audit log + notification) regardless of how many adapters fail.
+
+### Shared typed failure contract (`PortalFetchError`)
+
+`portals/errors.py` defines `PortalFetchError`, re-exported from `portals/base_adapter.py`. It
+carries controlled fields only — `portal`, `operation` (`listing_fetch` / `authentication` /
+`response_parse`), `category` (`timeout` / `connection` / `http_status` / `authentication` /
+`response_parse`), `attempts`, optional `http_status`, and a controlled `reason`/remediation.
+`__str__()` is built solely from these fields and never includes `str(cause)`, request URLs with
+query strings, headers, bodies, or credentials. The original exception is preserved via
+`raise PortalFetchError(...) from exc` (available on `__cause__`, excluded from the string).
+`_log_http_error()` strips the URL query string and never logs `Authorization` headers. Safe
+message shapes: `UNDP listing_fetch failed after 3 attempts: timeout (ReadTimeout)`,
+`UNDP listing_fetch failed after 1 attempt: non-retryable HTTP 404`,
+`Devex authentication failed after 1 attempt: check DEVEX_EMAIL and DEVEX_PASSWORD`.
+
+### UNDP listing retry policy (listing page only)
+
+The UNDP listing fetch uses `_fetch_listing_with_retry()`: at most 3 attempts, 20s per-attempt
+timeout, 75s total listing-phase deadline (every request and sleep clamped to the remaining
+budget). It retries only on `httpx.TimeoutException`, connection errors, HTTP 429, and HTTP 5xx;
+other 4xx are non-retryable and fail immediately. Backoff is 1s then 2s plus 0–0.25s jitter,
+capped at 10s (including honored `Retry-After`, numeric or HTTP-date) and clamped to the
+remaining deadline. It reuses the shared client and never acquires the detail-page semaphore.
+On exhaustion/deadline it raises `PortalFetchError` (listing_fetch); a structurally missing
+listing table raises `response_parse`; a present table with zero cards returns `[]`.
+The detail-page concurrency, semaphore, per-attempt timeout, retry behavior, and 120s
+enrichment deadline are unchanged. Portal-specific retry mechanics for the other adapters are
+deferred; they receive failure-semantics changes only.
 
 ### Hard requirement: per-adapter exception isolation
 

@@ -57,11 +57,14 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
     create `DevexSearch` and `DevexParser`, collect URLs, parse each URL in a try/except,
     remap `devex_opportunity_id` → `opportunity_id`, set `source_portal = "devex"`
   - Catch `AuthenticationError`: log via `AuditLogger`, alert via `Notifier`, return `[]`
+    (SUPERSEDED by Task 15 — now raises a typed `PortalFetchError` with the
+    `check DEVEX_EMAIL and DEVEX_PASSWORD` remediation and no adapter-level alert)
   - Close all Playwright resources in `finally` block unconditionally
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 7.1, 7.2_
 
   - [x] 4.1 Write unit tests for DevexAdapter error paths
     - Test `AuthenticationError` path: assert `[]` returned, audit + notifier called
+      (SUPERSEDED by Task 15 — asserts typed `PortalFetchError`, no adapter alert)
     - Test per-URL parse failure: assert partial results returned, loop continues
     - Test Playwright `finally` close: assert `auth.close()` called even when exception raised
     - _Requirements: 2.3, 2.4, 2.5_
@@ -90,6 +93,8 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
   - [x] 5.1 Write unit tests for SAMGovAdapter guard and HTTP error paths
     - Test `samgov_enabled=False` returns `[]` without making HTTP calls
     - Test HTTP 4xx/5xx: assert `[]` returned, error logged
+      (SUPERSEDED by Task 15 — now asserts a typed `PortalFetchError` (http_status)
+      is raised, with the `api_key` never appearing in logs/message/alert)
     - _Requirements: 3.5, 3.6_
 
   - [x] 5.2 Write property test for SAMGovAdapter query params
@@ -121,7 +126,11 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
   - [x] 6.1 Write unit tests for PerplexityAdapter guard and error paths
     - Test `perplexity_enabled=False` returns `[]` without HTTP calls
     - Test HTTP error returns `[]` with error logged
+      (SUPERSEDED by Task 15 — now asserts a typed `PortalFetchError` is raised
+      and the bearer token never appears in logs/message/alert)
     - Test unparseable JSON response returns `[]` with parse failure logged
+      (SUPERSEDED by Task 15 — now asserts a typed `PortalFetchError` (response_parse)
+      is raised; a genuinely empty JSON array still returns `[]`)
     - _Requirements: 4.5, 4.6, 4.7_
 
   - [x] 6.2 Write property test for Perplexity prompt content
@@ -318,3 +327,41 @@ flowchart TD
     T10 --> C11
     C11 --> C13{{13. Final checkpoint}}
 ```
+
+- [x] 15. Adapter fetch-error contract + UNDP listing retry (branch `fix/adapter-fetch-error-contract`)
+  - Add shared `PortalFetchError` in `portals/errors.py`; controlled fields only
+    (portal, operation, category, attempts, optional http_status, controlled reason);
+    `__str__` never includes cause/URL-query/headers/body/credentials; preserve cause
+    via `raise ... from exc`. Re-export from `portals/base_adapter.py`; sanitize
+    `_log_http_error()` (strip query string, never log Authorization). Add
+    `_safe_cause_label()`, `_sanitize_url()`, and `classify_requests_error()` helpers.
+  - Apply failure semantics: Devex (raise typed on auth + listing/search failure,
+    remove adapter-level `AuditLogger`/`Notifier`, keep `auth.close()` in `finally`,
+    preserve `check DEVEX_EMAIL and DEVEX_PASSWORD`); SAM.gov + Perplexity (httpx
+    http_status/timeout/connection + whole-response parse → typed; never expose
+    api_key / bearer token); World Bank + Grants.gov/USAID (requests errors →
+    typed via `classify_requests_error`, json() failure → response_parse).
+  - `[]` means a successful fetch with zero results; whole-adapter failures raise.
+  - IADB/OECD left unchanged (intentional `adapter_blocked` placeholders).
+  - Orchestrator unchanged: it already catches the typed error, increments `errors`
+    once, sends exactly one component-specific alert, and continues later adapters.
+  - UNDP listing-only retry: 3 attempts, 20s/attempt, 75s phase deadline, backoff
+    1s→2s + 0–0.25s jitter, max sleep 10s incl. `Retry-After`, clamp to remaining
+    budget; retry only timeout/connection/429/5xx; missing table → `response_parse`,
+    present table with zero cards → `[]`. Detail-page concurrency, semaphore,
+    per-attempt timeout, retry, and the 120s enrichment deadline are unchanged; the
+    listing phase never acquires the detail semaphore.
+  - [x] 15.1 Tests
+    - `tests/test_portal_fetch_error.py`: message shapes, sanitization, chaining,
+      `_sanitize_url`, `_safe_cause_label`.
+    - `tests/test_adapter_fetch_error_contract.py`: sentinel-credential safety for
+      Devex/Perplexity/SAM.gov; WB/Grants.gov/SAM.gov/Perplexity raise (not `[]`);
+      genuine empty → `[]`; Perplexity whole-response parse raises; real
+      `main.run_scraper()` path → one safe component alert, `errors=1`, no
+      failed-adapter LLM/write, later healthy adapter still processed.
+    - `tests/test_undp_listing_retry.py`: all 10 listing scenarios, deterministic
+      (time/sleep/jitter/HTTP patched).
+    - Updated `tests/test_devex_adapter.py`, `tests/test_samgov_adapter.py`,
+      `tests/test_perplexity_adapter.py` to the typed-error contract.
+  - _Requirements: 12.1–12.16, 2.3, 2.4, 3.5, 4.5, 4.6, 6.4, 11.18_
+  - _Note: no live verification claimed; all tests use mocks/fakes only._

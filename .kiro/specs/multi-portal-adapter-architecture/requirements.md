@@ -55,8 +55,8 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 
 1. THE `Devex_Adapter` SHALL implement `BasePortalAdapter` and reside in `portals/devex_adapter.py`.
 2. WHEN `fetch_opportunities()` is called, THE `Devex_Adapter` SHALL authenticate via `DevexAuth`, collect opportunity URLs via `DevexSearch`, parse each URL via `DevexParser`, and return a list of `Opportunity_Dict` instances.
-3. WHEN `DevexAuth` raises `AuthenticationError`, THE `Devex_Adapter` SHALL log the error via `AuditLogger`, send an error alert via `Notifier`, and return an empty list without raising.
-4. WHEN a single opportunity URL fails to parse, THE `Devex_Adapter` SHALL log the error and continue processing remaining URLs.
+3. WHEN `DevexAuth` raises `AuthenticationError`, THE `Devex_Adapter` SHALL raise a `PortalFetchError` (operation `authentication`, category `authentication`) whose message preserves the remediation guidance `check DEVEX_EMAIL and DEVEX_PASSWORD` and never contains the configured email or password. The `Devex_Adapter` SHALL NOT send its own `AuditLogger`/`Notifier` alert — alerting and error counting are owned by the `Orchestrator` (see Requirement 12). The original `AuthenticationError` SHALL be preserved as the exception cause via chaining.
+4. WHEN a single opportunity URL fails to parse, THE `Devex_Adapter` SHALL log the error and continue processing remaining URLs (per-record parsing failures yield partial results). A whole-adapter listing/search fetch failure SHALL instead raise a `PortalFetchError` (operation `listing_fetch`).
 5. THE `Devex_Adapter` SHALL close all Playwright resources in a `finally` block regardless of success or failure.
 6. THE `Devex_Adapter.portal_name` SHALL return `"devex"`.
 
@@ -72,7 +72,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 2. WHEN `fetch_opportunities()` is called, THE `SAMGov_Adapter` SHALL send HTTP GET requests to `https://api.sam.gov/opportunities/v2/search` using the `SAM_GOV_API_KEY` from `Config`.
 3. THE `SAMGov_Adapter` SHALL construct query parameters using `Config.sector_keywords` joined as a space-separated string for the `q` parameter, and `Config.max_results` for the `limit` parameter.
 4. WHEN the SAM.gov API returns a successful response, THE `SAMGov_Adapter` SHALL map each result to an `Opportunity_Dict` containing at minimum: `opportunity_title`, `funder_organisation`, `country_region`, `deadline`, `contract_value`, `opportunity_link`, `description_snippet`, and a `source_portal` field set to `"samgov"`.
-5. WHEN the SAM.gov API returns an HTTP error status, THE `SAMGov_Adapter` SHALL log the error and return an empty list without raising.
+5. WHEN the SAM.gov API request fails (HTTP error status, timeout, connection error, or an unparseable whole response), THE `SAMGov_Adapter` SHALL raise a `PortalFetchError` with the appropriate category (`http_status`, `timeout`, `connection`, or `response_parse`) rather than returning an empty list. The `api_key` query-string value SHALL NEVER appear in logs, the error message, or the resulting alert (URLs are logged with their query string stripped). A successful response with genuinely zero results SHALL still return an empty list.
 6. WHEN `Config.samgov_enabled` is `False`, THE `SAMGov_Adapter` SHALL return an empty list immediately without making any API calls.
 7. THE `SAMGov_Adapter.portal_name` SHALL return `"samgov"`.
 
@@ -88,8 +88,8 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 2. WHEN `fetch_opportunities()` is called, THE `Perplexity_Adapter` SHALL send a POST request to the Perplexity chat completions API endpoint using the `PERPLEXITY_API_KEY` from `Config` and the model `sonar-pro`.
 3. THE `Perplexity_Adapter` SHALL construct a prompt using `Config.sector_keywords` and `Config.target_countries` to request a structured list of current procurement opportunities, leveraging `sonar-pro`'s real-time web search capability.
 4. WHEN the Perplexity API returns a valid response, THE `Perplexity_Adapter` SHALL parse the response text into a list of `Opportunity_Dict` instances, each containing at minimum: `opportunity_title`, `funder_organisation`, `country_region`, `deadline`, `opportunity_link`, `description_snippet`, and a `source_portal` field set to `"perplexity"`.
-5. WHEN the Perplexity API response cannot be parsed into structured opportunity data, THE `Perplexity_Adapter` SHALL log the parse failure and return an empty list.
-6. WHEN the Perplexity API returns an HTTP error status, THE `Perplexity_Adapter` SHALL log the error and return an empty list without raising.
+5. WHEN the whole Perplexity API response cannot be parsed into structured opportunity data, THE `Perplexity_Adapter` SHALL log the parse failure and raise a `PortalFetchError` (operation `response_parse`, category `response_parse`) rather than returning an empty list. A successful response that legitimately contains zero opportunities (e.g. an empty JSON array) SHALL still return an empty list.
+6. WHEN the Perplexity API request fails (HTTP error status, timeout, or connection error), THE `Perplexity_Adapter` SHALL raise a `PortalFetchError` with the appropriate category. The bearer token / `Authorization` header value SHALL NEVER appear in logs, the error message, or the resulting alert.
 7. WHEN `Config.perplexity_enabled` is `False`, THE `Perplexity_Adapter` SHALL return an empty list immediately without making any API calls.
 8. THE `Perplexity_Adapter.portal_name` SHALL return `"perplexity"`.
 
@@ -122,7 +122,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 1. THE `Orchestrator` SHALL instantiate all adapters whose corresponding `enabled` flag in `Config` is `True`, including `Devex_Adapter` (controlled by `Config.devex_enabled`), `SAMGov_Adapter`, and `Perplexity_Adapter`.
 2. WHEN iterating adapters, THE `Orchestrator` SHALL call `adapter.fetch_opportunities()` for each active adapter and collect all returned `Opportunity_Dict` instances into a single unified list.
 3. THE `Orchestrator` SHALL apply `KeywordFilter`, duplicate detection, `LLMInterpreter`, and `Store` writes to the unified list using the same logic as the current single-portal pipeline.
-4. WHEN an adapter's `fetch_opportunities()` raises an unhandled exception, THE `Orchestrator` SHALL log the error, send an error alert identifying the adapter by `portal_name`, and continue processing remaining adapters.
+4. WHEN an adapter's `fetch_opportunities()` raises an exception (including a typed `PortalFetchError`), THE `Orchestrator` SHALL increment its `errors` count exactly once, log the error, send exactly one error alert identifying the adapter by `portal_name` (component), and continue processing remaining adapters. The failed adapter SHALL NOT be subjected to any LLM interpretation or `Store` write. Because `PortalFetchError.__str__()` is built only from controlled fields, the alert text carries the portal, operation, category/reason, and attempt count without exposing credentials.
 5. THE `Orchestrator` SHALL include the `source_portal` value from each `Opportunity_Dict` in the audit log entry for that opportunity.
 6. THE `Orchestrator` SHALL pass the `source_portal` value from each `Opportunity_Dict` through to the `OpportunityRecord` so that it is persisted as `portal_source` (the external column label) in Google Sheets and as `source_portal` in Airtable.
 7. THE `Orchestrator` SHALL deduplicate across adapters using the opportunity's `opportunity_link` as the unique key when a portal-specific ID is unavailable.
@@ -199,7 +199,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 15. WHEN the `UNDP_Adapter` computes a retry backoff delay, THE `UNDP_Adapter` SHALL use exponential backoff of `0.5 * 2^(attempt-1)` seconds plus random jitter, clamped to the remaining Enrichment_Deadline.
 16. WHEN a retryable detail-page response includes a `Retry-After` header, THE `UNDP_Adapter` SHALL honor the header in both the delay-seconds format and the HTTP-date (RFC 7231) format, and SHALL clamp the resulting wait to the remaining Enrichment_Deadline.
 17. IF a `Retry-After` header value cannot be parsed as either delay-seconds or an HTTP-date, THEN THE `UNDP_Adapter` SHALL fall back to the exponential backoff delay.
-18. THE Enrichment_Deadline of 120 seconds SHALL apply only to the Enrichment_Phase and SHALL NOT constrain the listing-page fetch, which SHALL use the shared HTTP client's per-request timeout.
+18. THE Enrichment_Deadline of 120 seconds SHALL apply only to the Enrichment_Phase and SHALL NOT constrain the listing-page fetch, which is governed by its own separate listing retry policy (see Requirement 12). The detail-page concurrency, its semaphore, its per-attempt timeout, its retry behavior, and the 120-second Enrichment_Deadline SHALL remain unchanged by that listing policy.
 19. THE `UNDP_Adapter` SHALL apply a per-attempt request timeout of 12 seconds to each individual detail-page fetch attempt.
 20. WHEN the Enrichment_Deadline is reached, THE `UNDP_Adapter` SHALL cancel all still-pending enrichment tasks and await them via `gather(..., return_exceptions=True)` so that no enrichment task remains pending.
 21. WHEN an opportunity's enrichment completes successfully before the Enrichment_Deadline, THE `UNDP_Adapter` SHALL retain that opportunity's enriched `_matching_text` and `description_snippet` values.
@@ -207,3 +207,42 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 23. WHEN the Enrichment_Deadline causes one or more enrichment tasks to be cancelled, THE `UNDP_Adapter` SHALL log a warning containing the total, completed, fallback, and cancelled counts. No such warning is emitted when enrichment completes without any cancellation.
 24. WHEN `main.run_scraper()` processes the unified deduplicated opportunity list, THE `Orchestrator` SHALL apply the `KeywordFilter` a second time over that list, strip the Transient_Fields, construct an `OpportunityRecord` for each passing opportunity, and — while in live run mode — call `Store.write_record` exactly once per passing opportunity.
 25. WHEN an opportunity's only matching sector keyword appears after character 1000 of its `_matching_text` value while its `description_snippet` is exactly 1000 characters and contains no matching keyword, THE `Orchestrator` SHALL pass that opportunity through the `KeywordFilter`, record the correct matched keyword, retain a `description_snippet` of at most 1000 characters, and produce a stored record in which the `_matching_text` and `_full_overview` fields are absent; WHILE in live run mode THE `Orchestrator` SHALL call `Store.write_record` exactly once for that passing opportunity, and WHILE in `dry_run` mode THE `Orchestrator` SHALL NOT call `Store.write_record` for that opportunity.
+
+---
+
+### Requirement 12: Shared Adapter Fetch-Error Contract and UNDP Listing Retry
+
+**User Story:** As an operator, I want a single, credential-safe typed failure for whole-adapter fetch problems and a bounded retry for the UNDP listing page, so that transient failures are absorbed, real failures surface clearly to the orchestrator, and no secret ever reaches a log or alert.
+
+#### Acceptance Criteria
+
+**Shared typed failure contract**
+
+1. THE `portals` package SHALL define a shared `PortalFetchError` exception carrying controlled fields: `portal` (component), `operation` (e.g. `listing_fetch`, `authentication`, `response_parse`), `category` (`timeout`, `connection`, `http_status`, `authentication`, or `response_parse`), `attempts`, an optional `http_status`, and an optional controlled `reason`/remediation string.
+2. THE `PortalFetchError.__str__()` method SHALL be constructed ONLY from those controlled fields. It SHALL NOT include `str(cause)`/`repr(cause)`, complete request URLs containing query strings, request or response headers, request bodies, or any credential (password, API key, bearer token, cookie).
+3. WHEN an adapter raises a `PortalFetchError`, THE adapter SHALL preserve the original exception as the cause via `raise PortalFetchError(...) from exc`, keeping it available for debugging while excluding it from the user-visible string.
+4. Expected safe message shapes SHALL include: `UNDP listing_fetch failed after 3 attempts: timeout (ReadTimeout)`, `UNDP listing_fetch failed after 1 attempt: non-retryable HTTP 404`, and `Devex authentication failed after 1 attempt: check DEVEX_EMAIL and DEVEX_PASSWORD`.
+5. WHERE `_log_http_error()` logs a request URL, THE base adapter SHALL strip the URL's query string before logging, and SHALL NEVER log `Authorization` headers.
+
+**Consistent failure semantics (Devex, UNDP, World Bank, Grants.gov/USAID, SAM.gov, Perplexity)**
+
+6. A successful fetch that genuinely yields zero results SHALL return an empty list `[]`.
+7. A request failure, authentication failure, or whole-response parse failure SHALL raise a `PortalFetchError`. Per-record parsing failures MAY remain logged and skipped where partial results are intentionally supported (e.g. Devex per-URL parsing).
+8. THE active adapters SHALL NOT send their own failure notification; alerting and error counting are owned by the `Orchestrator` (Requirement 6.4). The orchestrator's adapter-level `try/except` catches the typed error, increments `errors`, alerts once, and continues later adapters.
+
+**IADB and OECD**
+
+9. THE `IADB_Adapter` and `OECD_Adapter` SHALL remain intentional `adapter_blocked` placeholders that return `[]`; they SHALL NOT be converted to raise transient `PortalFetchError`.
+
+**UNDP listing retry policy (listing page only)**
+
+10. THE `UNDP_Adapter` listing-page fetch SHALL attempt at most 3 times total, with a per-attempt request timeout of 20 seconds and a total listing-phase deadline of 75 seconds; every request and sleep SHALL be clamped to the remaining 75-second budget.
+11. THE listing fetch SHALL retry only on `httpx.TimeoutException`, connection/network exceptions, HTTP 429, and HTTP 5xx; it SHALL NOT retry other HTTP 4xx.
+12. THE listing retry backoff SHALL be 1 second then 2 seconds, plus jitter of 0 to 0.25 seconds, with every sleep (including any honored `Retry-After`, numeric or HTTP-date) capped at 10 seconds and clamped to the remaining deadline.
+13. THE listing fetch SHALL reuse the shared async HTTP client and SHALL NEVER acquire or hold the detail-page concurrency semaphore during listing attempts or backoff.
+14. WHEN listing attempts are exhausted or the 75-second deadline is reached, THE `UNDP_Adapter` SHALL raise a `PortalFetchError` (operation `listing_fetch`).
+15. IF the listing HTTP response succeeds but the expected listing table is structurally missing, THEN THE `UNDP_Adapter` SHALL raise a `response_parse` `PortalFetchError`; IF the expected table is present but contains zero cards, THEN THE `UNDP_Adapter` SHALL return an empty list `[]`.
+
+**Credential safety (proven by tests)**
+
+16. FOR every wrapped `PortalFetchError` and any resulting orchestrator alert, no sentinel credential value, `Authorization` header value, or secret-bearing query string SHALL appear; the controlled portal, operation, category, and remediation text SHALL remain; and the original cause SHALL be preserved via chaining without being added to the user-visible string.
