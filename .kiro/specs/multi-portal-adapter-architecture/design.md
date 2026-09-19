@@ -1023,8 +1023,10 @@ message shapes: `UNDP listing_fetch failed after 3 attempts: timeout (ReadTimeou
 
 The UNDP listing fetch uses `_fetch_listing_with_retry()`: at most 3 attempts, 20s per-attempt
 timeout, 75s total listing-phase deadline (every request and sleep clamped to the remaining
-budget). It retries only on `httpx.TimeoutException`, connection errors, HTTP 429, and HTTP 5xx;
-other 4xx are non-retryable and fail immediately. Backoff is 1s then 2s plus 0–0.25s jitter,
+budget). It retries only on `httpx.TimeoutException`, connection errors, HTTP 429, and the whole
+HTTP 5xx range via `_listing_status_is_retryable(status)` (`status == 429 or 500 <= status <= 599`,
+covering uncommon codes like 501/599); other 4xx are non-retryable and fail immediately. Backoff
+is 1s then 2s plus 0–0.25s jitter,
 capped at 10s (including honored `Retry-After`, numeric or HTTP-date) and clamped to the
 remaining deadline. It reuses the shared client and never acquires the detail-page semaphore.
 On exhaustion/deadline it raises `PortalFetchError` (listing_fetch); a structurally missing

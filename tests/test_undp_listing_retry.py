@@ -35,6 +35,7 @@ from portals.undp_adapter import (
     _LISTING_MAX_ATTEMPTS,
     _LISTING_MAX_RETRY_SLEEP,
     _LISTING_PHASE_DEADLINE,
+    _listing_status_is_retryable,
 )
 
 
@@ -206,6 +207,38 @@ def test_listing_5xx_retries_and_recovers():
 
     assert client.listing_calls == 2
     assert len(results) >= 1
+
+
+@pytest.mark.parametrize("adversarial_status", [501, 599])
+def test_listing_uncommon_5xx_retries_and_recovers(adversarial_status):
+    """Adversarial: a 5xx code OUTSIDE the old {500,502,503,504} subset (e.g.
+    501, 599) must still be retried. Fails once, then succeeds → 2 attempts."""
+    def handler(call_n):
+        if call_n == 1:
+            return FakeResponse("", status_code=adversarial_status)
+        return FakeResponse(_listing_html(_card_html("Governance reform")))
+
+    adapter = UNDPAdapter(_make_config())
+    client = FakeClient(handler)
+    results = _patched_run(adapter, client, [])
+
+    assert client.listing_calls == 2, (
+        f"HTTP {adversarial_status} should be retryable (2 attempts), "
+        f"got {client.listing_calls}"
+    )
+    assert len(results) >= 1
+
+
+def test_listing_status_retryable_predicate():
+    """Every 5xx plus 429 is retryable; other 4xx are not."""
+    assert _listing_status_is_retryable(429)
+    for status in (500, 501, 502, 503, 504, 505, 550, 599):
+        assert _listing_status_is_retryable(status), status
+    for status in (400, 401, 403, 404, 405, 410, 418, 451):
+        assert not _listing_status_is_retryable(status), status
+    # 2xx/3xx are handled as success, not "retryable" failures.
+    assert not _listing_status_is_retryable(200)
+    assert not _listing_status_is_retryable(302)
 
 
 # ---------------------------------------------------------------------------

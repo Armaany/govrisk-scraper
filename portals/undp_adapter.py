@@ -59,8 +59,16 @@ _LISTING_PHASE_DEADLINE = 75       # seconds — whole listing phase must finish
 _LISTING_BACKOFF_SCHEDULE = (1.0, 2.0)  # backoff before retry #1, retry #2
 _LISTING_JITTER_MAX = 0.25         # seconds — added uniformly to each backoff
 _LISTING_MAX_RETRY_SLEEP = 10      # seconds — hard cap on any sleep incl. Retry-After
-# Retryable listing conditions: transient network errors + these status codes.
-_LISTING_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _listing_status_is_retryable(status: int) -> bool:
+    """Return True when a listing HTTP status should be retried.
+
+    Retryable: HTTP 429 (Too Many Requests) and the entire 5xx server-error
+    range (500–599). All other 4xx are non-retryable. This deliberately covers
+    every 5xx (e.g. 501, 505, 599), not just a hand-picked subset.
+    """
+    return status == 429 or 500 <= status <= 599
 
 # Display/storage truncation (NOT used for keyword matching)
 _DESCRIPTION_DISPLAY_MAX = 1000
@@ -359,9 +367,9 @@ class UNDPAdapter(BasePortalAdapter):
 
             status = resp.status_code
 
-            # Non-retryable 4xx (and any other non-2xx not in the retry set):
-            # fail immediately with exactly this one attempt counted.
-            if status >= 400 and status not in _LISTING_RETRYABLE_STATUS_CODES:
+            # Non-retryable status (4xx other than 429): fail immediately with
+            # exactly this one attempt counted.
+            if status >= 400 and not _listing_status_is_retryable(status):
                 self._log_error(
                     Exception(f"HTTP {status}"), detail="listing fetch non-retryable status"
                 )
@@ -374,8 +382,8 @@ class UNDPAdapter(BasePortalAdapter):
                     reason="non-retryable",
                 )
 
-            # Retryable status (429 / 5xx): respect Retry-After, then retry.
-            if status in _LISTING_RETRYABLE_STATUS_CODES:
+            # Retryable status (429 or any 5xx): respect Retry-After, then retry.
+            if _listing_status_is_retryable(status):
                 last_status = status
                 last_transient = None
                 retry_after = resp.headers.get("Retry-After", "")

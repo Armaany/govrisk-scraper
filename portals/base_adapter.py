@@ -99,14 +99,53 @@ class BasePortalAdapter(ABC):
         ...
 
     # --- Helper logging methods ---
+    #
+    # CREDENTIAL SAFETY: for expected adapter failures these helpers log ONLY
+    # controlled information — portal, an optional detail/operation label, the
+    # exception CLASS name (never its message), an optional HTTP status, and a
+    # query-string-stripped URL when the exception carries one. They never
+    # render the raw exception message, headers, body, credentials, or a
+    # secret-bearing traceback (no ``exc_info``). The original cause is
+    # preserved only through exception chaining on the raised
+    # ``PortalFetchError``, not in these log lines.
+
+    def _safe_http_status(self, exc: Exception):
+        """Extract an HTTP status code from an exception's response, or None."""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status_code", None)
+            if status is not None:
+                return status
+        return None
+
+    def _safe_request_url(self, exc: Exception):
+        """Return the sanitized (query-stripped) request URL, or None."""
+        request = getattr(exc, "request", None)
+        if request is not None:
+            url = getattr(request, "url", None)
+            if url is not None:
+                return _sanitize_url(url)
+        return None
 
     def _log_error(self, exc: Exception, detail: str = "") -> None:
-        """Log a generic error using the standard logging module."""
-        msg = f"[{self.portal_name}] Error"
+        """Log a generic (expected) adapter failure using controlled fields only.
+
+        Logs the portal, optional detail, and the exception CLASS name — never
+        the raw exception message or a traceback, either of which could embed a
+        secret-bearing URL/header. When available, a sanitized request URL and
+        HTTP status are appended.
+        """
+        parts = [f"[{self.portal_name}] Error"]
         if detail:
-            msg += f" — {detail}"
-        msg += f": {exc}"
-        logger.error(msg, exc_info=exc)
+            parts.append(f"— {detail}")
+        parts.append(f"({_safe_cause_label(exc)})")
+        status = self._safe_http_status(exc)
+        if status is not None:
+            parts.append(f"status={status}")
+        safe_url = self._safe_request_url(exc)
+        if safe_url is not None:
+            parts.append(f"url={safe_url}")
+        logger.error(" ".join(parts))
 
     def _log_http_error(self, exc: "httpx.HTTPStatusError") -> None:
         """Log an HTTP status error (4xx/5xx) from an httpx request.
@@ -116,15 +155,10 @@ class BasePortalAdapter(ABC):
         whose ``str()`` embeds the full URL — is NOT logged. Authorization
         headers are never logged.
         """
-        try:
-            status = exc.response.status_code
-        except Exception:
+        status = self._safe_http_status(exc)
+        if status is None:
             status = "?"
-        safe_url = "?"
-        try:
-            safe_url = _sanitize_url(exc.request.url)
-        except Exception:
-            pass
+        safe_url = self._safe_request_url(exc) or "?"
         logger.error(
             "[%s] HTTP error %s for URL %s",
             self.portal_name,
@@ -133,19 +167,25 @@ class BasePortalAdapter(ABC):
         )
 
     def _log_parse_error(self, exc: Exception) -> None:
-        """Log a response parse failure (e.g. invalid JSON or unexpected schema)."""
+        """Log a response parse failure using controlled fields only.
+
+        Logs only the exception CLASS name (e.g. ``JSONDecodeError``); never the
+        raw message, response body, or a traceback.
+        """
         logger.error(
-            "[%s] Parse error: %s",
+            "[%s] Parse error (%s)",
             self.portal_name,
-            exc,
-            exc_info=exc,
+            _safe_cause_label(exc),
         )
 
     def _log_auth_error(self, exc: Exception) -> None:
-        """Log an authentication failure."""
+        """Log an authentication failure using controlled fields only.
+
+        Logs only the exception CLASS name; never the raw message (which may
+        embed the configured email/password) or a traceback.
+        """
         logger.error(
-            "[%s] Authentication error: %s",
+            "[%s] Authentication error (%s)",
             self.portal_name,
-            exc,
-            exc_info=exc,
+            _safe_cause_label(exc),
         )

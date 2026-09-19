@@ -81,7 +81,21 @@ class PerplexityAdapter(BasePortalAdapter):
                     reason=_safe_cause_label(exc),
                 ) from exc
 
-        return self._parse_response(response.json())
+        # Decode the HTTP response body. A body that is not valid JSON is a
+        # whole-response parse failure → typed, credential-safe PortalFetchError.
+        try:
+            data = response.json()
+        except Exception as exc:
+            self._log_parse_error(exc)
+            raise PortalFetchError(
+                "Perplexity",
+                OP_RESPONSE_PARSE,
+                CATEGORY_RESPONSE_PARSE,
+                attempts=1,
+                reason=_safe_cause_label(exc),
+            ) from exc
+
+        return self._parse_response(data)
 
     def _build_prompt(self) -> str:
         keywords = ", ".join(self.config.sector_keywords)

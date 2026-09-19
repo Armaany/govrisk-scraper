@@ -18,6 +18,7 @@ All collaborators are mocked/faked. No real portal/Google/Anthropic/Perplexity/
 SAM.gov/email requests are made.
 """
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -440,3 +441,186 @@ def test_orchestrator_one_safe_alert_errors_one_and_continues():
     assert interpreter.interpret.call_count == 1
     assert store.write_record.call_count == 1
     assert filtered == [healthy_opp]
+
+
+# ---------------------------------------------------------------------------
+# Blocker-2 regression: LOG credential safety. The prior _log_error /
+# _log_auth_error / _log_parse_error interpolated the raw exception and used
+# exc_info=exc, leaking secret-bearing URLs/messages into logs. These tests
+# assert no sentinel appears anywhere in the captured log text, while the
+# expected typed error still propagates.
+#
+# pytest's `caplog` captures records from the root logger by propagation; we
+# raise the capture level to DEBUG so nothing is filtered out.
+# ---------------------------------------------------------------------------
+
+def _assert_no_secrets_in_logs(caplog) -> None:
+    # Full formatted text (message only) ...
+    text = caplog.text
+    _assert_no_secrets(text)
+    assert SENTINEL_DEVEX_EMAIL not in text
+    # ... and every record's rendered message + any attached exception text.
+    for record in caplog.records:
+        rendered = record.getMessage()
+        for sentinel in (SENTINEL_DEVEX_PW, SENTINEL_PPLX_KEY, SENTINEL_SAM_KEY,
+                         SENTINEL_DEVEX_EMAIL):
+            assert sentinel not in rendered, f"sentinel leaked in log message: {sentinel!r}"
+        # No secret-bearing traceback should be attached (exc_info must be None).
+        assert record.exc_info is None, (
+            "expected-failure logs must not attach exc_info (secret-bearing traceback)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_devex_auth_failure_logs_carry_no_secrets(caplog):
+    """Devex auth failure: the sentinel email/password in the raw
+    AuthenticationError message must never reach the logs."""
+    config = make_config()
+    adapter = DevexAdapter(config)
+
+    mock_auth = AsyncMock()
+    mock_auth.load_session.side_effect = AuthenticationError(
+        f"login failed for {SENTINEL_DEVEX_EMAIL} using password {SENTINEL_DEVEX_PW}"
+    )
+    mock_auth.close = AsyncMock()
+
+    with patch("portals.devex_adapter.DevexAuth", return_value=mock_auth):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError):
+                await adapter.fetch_opportunities()
+
+    _assert_no_secrets_in_logs(caplog)
+
+
+def test_worldbank_connection_failure_logs_carry_no_secrets(caplog):
+    """World Bank connection error whose message embeds a secret-bearing URL
+    must not leak the sentinel into the logs."""
+    import requests
+
+    config = make_config()
+    adapter = WorldBankAdapter(config)
+
+    with patch(
+        "portals.worldbank_adapter.requests.get",
+        side_effect=requests.exceptions.ConnectionError(
+            f"failed to connect to https://wb/api?api_key={SENTINEL_SAM_KEY}"
+        ),
+    ):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError):
+                asyncio.run(adapter.fetch_opportunities())
+
+    _assert_no_secrets_in_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_samgov_timeout_logs_carry_no_secrets(caplog):
+    """SAM.gov timeout whose underlying request URL carries the api_key must not
+    leak the sentinel into the logs (the api_key lives in the query string)."""
+    config = make_config()
+    adapter = SAMGovAdapter(config)
+
+    leaky_url = f"https://api.sam.gov/opportunities/v2/search?api_key={SENTINEL_SAM_KEY}&q=x"
+    request = httpx.Request("GET", leaky_url)
+
+    client = _async_client(
+        get_side_effect=httpx.ReadTimeout(
+            f"timed out for {leaky_url}", request=request
+        )
+    )
+
+    with patch("portals.samgov_adapter.httpx.AsyncClient", return_value=client):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError):
+                await adapter.fetch_opportunities()
+
+    _assert_no_secrets_in_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_samgov_connection_failure_logs_carry_no_secrets(caplog):
+    """SAM.gov connection error carrying the secret-bearing URL must not leak."""
+    config = make_config()
+    adapter = SAMGovAdapter(config)
+
+    leaky_url = f"https://api.sam.gov/opportunities/v2/search?api_key={SENTINEL_SAM_KEY}&q=x"
+    request = httpx.Request("GET", leaky_url)
+
+    client = _async_client(
+        get_side_effect=httpx.ConnectError(
+            f"cannot connect: {leaky_url}", request=request
+        )
+    )
+
+    with patch("portals.samgov_adapter.httpx.AsyncClient", return_value=client):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError):
+                await adapter.fetch_opportunities()
+
+    _assert_no_secrets_in_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_perplexity_timeout_logs_carry_no_secrets(caplog):
+    """Perplexity timeout whose request carries the Authorization: Bearer header
+    must not leak the bearer token into the logs."""
+    config = make_config()
+    adapter = PerplexityAdapter(config)
+
+    request = httpx.Request(
+        "POST",
+        "https://api.perplexity.ai/chat/completions",
+        headers={"Authorization": f"Bearer {SENTINEL_PPLX_KEY}"},
+    )
+
+    client = _async_client(
+        post_side_effect=httpx.ReadTimeout(
+            f"timed out; auth Bearer {SENTINEL_PPLX_KEY}", request=request
+        )
+    )
+
+    with patch("portals.perplexity_adapter.httpx.AsyncClient", return_value=client):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError):
+                await adapter.fetch_opportunities()
+
+    _assert_no_secrets_in_logs(caplog)
+
+
+# ---------------------------------------------------------------------------
+# Blocker-3 regression: PerplexityAdapter.response.json() failure is wrapped in
+# typed response_parse handling (chained, credential-safe).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_perplexity_response_json_raises_is_typed_and_safe(caplog):
+    config = make_config()
+    adapter = PerplexityAdapter(config)
+
+    # A 200 response whose .json() itself raises (invalid JSON body). The raw
+    # decode error message carries the bearer sentinel to prove non-leakage.
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status.return_value = None
+    json_error = ValueError(
+        f"Expecting value: line 1 (body leaked Bearer {SENTINEL_PPLX_KEY})"
+    )
+    mock_response.json.side_effect = json_error
+
+    client = _async_client(mock_response=mock_response)
+
+    with patch("portals.perplexity_adapter.httpx.AsyncClient", return_value=client):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(PortalFetchError) as excinfo:
+                await adapter.fetch_opportunities()
+
+    err = excinfo.value
+    assert err.portal == "Perplexity"
+    assert err.operation == OP_RESPONSE_PARSE
+    assert err.category == CATEGORY_RESPONSE_PARSE
+    # Safe string; secret absent.
+    _assert_no_secrets(str(err))
+    # Cause preserved via chaining.
+    assert err.__cause__ is json_error
+    # And nothing leaked into the logs.
+    _assert_no_secrets_in_logs(caplog)

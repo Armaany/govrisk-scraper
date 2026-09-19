@@ -237,7 +237,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 **UNDP listing retry policy (listing page only)**
 
 10. THE `UNDP_Adapter` listing-page fetch SHALL attempt at most 3 times total, with a per-attempt request timeout of 20 seconds and a total listing-phase deadline of 75 seconds; every request and sleep SHALL be clamped to the remaining 75-second budget.
-11. THE listing fetch SHALL retry only on `httpx.TimeoutException`, connection/network exceptions, HTTP 429, and HTTP 5xx; it SHALL NOT retry other HTTP 4xx.
+11. THE listing fetch SHALL retry only on `httpx.TimeoutException`, connection/network exceptions, HTTP 429, and the entire HTTP 5xx range (semantics equivalent to `status == 429 or 500 <= status <= 599`, i.e. including uncommon codes such as 501 or 599); it SHALL NOT retry other HTTP 4xx.
 12. THE listing retry backoff SHALL be 1 second then 2 seconds, plus jitter of 0 to 0.25 seconds, with every sleep (including any honored `Retry-After`, numeric or HTTP-date) capped at 10 seconds and clamped to the remaining deadline.
 13. THE listing fetch SHALL reuse the shared async HTTP client and SHALL NEVER acquire or hold the detail-page concurrency semaphore during listing attempts or backoff.
 14. WHEN listing attempts are exhausted or the 75-second deadline is reached, THE `UNDP_Adapter` SHALL raise a `PortalFetchError` (operation `listing_fetch`).
