@@ -101,7 +101,7 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 
 #### Acceptance Criteria
 
-1. THE `Config` dataclass SHALL include a `devex_enabled: bool` field defaulting to `True`.
+1. THE `Config` dataclass SHALL include a `devex_enabled: bool` field defaulting to `False` (Devex is an optional authenticated portal, consistent with SAM.gov/Perplexity). THE `devex_email` and `devex_password` fields SHALL be optional, defaulting to empty strings.
 2. THE `Config` dataclass SHALL include a `samgov_api_key: Optional[str]` field defaulting to `None`.
 3. THE `Config` dataclass SHALL include a `samgov_enabled: bool` field defaulting to `False`.
 4. THE `Config` dataclass SHALL include a `perplexity_api_key: Optional[str]` field defaulting to `None`.
@@ -109,7 +109,8 @@ GovRisk's existing Python scraper currently targets a single portal (Devex) thro
 6. WHEN `samgov_enabled` is `True` and `samgov_api_key` is absent or empty, THE `load_config()` function SHALL raise `ValueError` with a message identifying the missing variable.
 7. WHEN `perplexity_enabled` is `True` and `perplexity_api_key` is absent or empty, THE `load_config()` function SHALL raise `ValueError` with a message identifying the missing variable.
 8. THE `load_config()` function SHALL read `DEVEX_ENABLED`, `SAM_GOV_API_KEY`, `SAM_GOV_ENABLED`, `PERPLEXITY_API_KEY`, and `PERPLEXITY_ENABLED` from environment variables.
-9. THE existing `Config` fields and validation logic SHALL remain unchanged.
+9. THE existing non-Devex `Config` fields and validation logic SHALL remain unchanged.
+10. THE `load_config()` function SHALL parse `DEVEX_ENABLED` (default `False`) BEFORE validating Devex credentials. WHEN `devex_enabled` is `False`, `DEVEX_EMAIL` and `DEVEX_PASSWORD` MAY be absent, empty, or whitespace-only and `load_config()` SHALL succeed. WHEN `devex_enabled` is `True`, both credentials remain mandatory: a missing/blank `DEVEX_EMAIL` SHALL raise a `ValueError` naming `DEVEX_EMAIL`, and a missing/blank `DEVEX_PASSWORD` SHALL raise a `ValueError` naming `DEVEX_PASSWORD`.
 
 ---
 

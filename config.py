@@ -75,8 +75,11 @@ _SPANISH_SECTOR_KEYWORDS: list[str] = [
 class Config:
     """Validated configuration for scraper runtime and integrations."""
 
-    devex_email: str
-    devex_password: str
+    # Devex credentials are optional: they are only required when Devex is
+    # enabled (DEVEX_ENABLED=true). Default to empty strings so a Devex-disabled
+    # configuration can load without them.
+    devex_email: str = ""
+    devex_password: str = ""
     devex_session_path: str = "./devex_session.json"
     anthropic_api_key: str = ""
     store_type: str = "sheets"
@@ -94,7 +97,7 @@ class Config:
     log_level: str = "INFO"
     notification_email: str = ""
     admin_alert_email: str = ""
-    devex_enabled: bool = True
+    devex_enabled: bool = False
     undp_enabled: bool = True
     iadb_enabled: bool = True
     oecd_enabled: bool = True
@@ -151,8 +154,20 @@ def load_config() -> Config:
     """Load, validate, and parse all runtime configuration from .env."""
     load_dotenv()
 
-    devex_email = _get_required("DEVEX_EMAIL")
-    devex_password = _get_required("DEVEX_PASSWORD")
+    # Parse DEVEX_ENABLED (default False, like the other optional authenticated
+    # portals) BEFORE validating Devex credentials.
+    devex_enabled = _parse_bool_env("DEVEX_ENABLED", False)
+
+    # Devex credentials are mandatory only when Devex is enabled. When disabled,
+    # they may be absent, empty, or whitespace-only.
+    devex_email = os.getenv("DEVEX_EMAIL", "").strip()
+    devex_password = os.getenv("DEVEX_PASSWORD", "").strip()
+    if devex_enabled:
+        if not devex_email:
+            raise ValueError("Missing required environment variable: DEVEX_EMAIL")
+        if not devex_password:
+            raise ValueError("Missing required environment variable: DEVEX_PASSWORD")
+
     anthropic_api_key = _get_required("ANTHROPIC_API_KEY")
     store_type = _get_required("STORE_TYPE").lower()
     run_mode = _get_required("RUN_MODE").lower()
@@ -180,7 +195,7 @@ def load_config() -> Config:
         if not airtable_base_id:
             raise ValueError("Missing required environment variable for airtable mode: AIRTABLE_BASE_ID")
 
-    devex_enabled = _parse_bool_env("DEVEX_ENABLED", True)
+    # devex_enabled was already parsed above (before credential validation).
     undp_enabled = _parse_bool_env("UNDP_ENABLED", True)
     iadb_enabled = _parse_bool_env("IADB_ENABLED", True)
     oecd_enabled = _parse_bool_env("OECD_ENABLED", True)

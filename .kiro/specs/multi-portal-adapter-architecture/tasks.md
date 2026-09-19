@@ -10,7 +10,8 @@ Two new adapters are added (SAM.gov, Perplexity). `source_portal` is persisted i
 ## Tasks
 
 - [x] 1. Extend Config with new portal fields and validation
-  - Add `devex_enabled: bool = True`, `samgov_api_key: Optional[str] = None`,
+  - Add `devex_enabled: bool = True` (SUPERSEDED by Task 16 — now defaults to
+    `False`; Devex creds optional unless enabled), `samgov_api_key: Optional[str] = None`,
     `samgov_enabled: bool = False`, `perplexity_api_key: Optional[str] = None`,
     `perplexity_enabled: bool = False` to the `Config` dataclass in `config.py`
   - Add `load_config()` reads for `DEVEX_ENABLED`, `SAM_GOV_API_KEY`, `SAM_GOV_ENABLED`,
@@ -365,3 +366,20 @@ flowchart TD
       `tests/test_perplexity_adapter.py` to the typed-error contract.
   - _Requirements: 12.1–12.16, 2.3, 2.4, 3.5, 4.5, 4.6, 6.4, 11.18_
   - _Note: no live verification claimed; all tests use mocks/fakes only._
+
+- [x] 16. Devex disabled-without-credentials config contract (branch `fix/adapter-fetch-error-contract`)
+  - `DEVEX_ENABLED` now defaults to `false` (Devex is an optional authenticated
+    portal, consistent with SAM.gov/Perplexity). `Config.devex_email` and
+    `Config.devex_password` are optional, defaulting to `""`.
+  - `load_config()` parses `DEVEX_ENABLED` BEFORE validating Devex credentials.
+    When disabled, `DEVEX_EMAIL`/`DEVEX_PASSWORD` may be absent/empty/whitespace
+    and loading succeeds. When enabled, both remain mandatory: missing/blank
+    email raises a `ValueError` naming `DEVEX_EMAIL`; missing/blank password
+    raises a `ValueError` naming `DEVEX_PASSWORD`.
+  - `.env.example` set to `DEVEX_ENABLED=false`. Real `.env` untouched. SAM.gov
+    and Perplexity behavior unchanged.
+  - Tests: `tests/test_config.py` updated (default now `False`, `load_dotenv`
+    mocked in all `load_config()` tests) and extended with disabled+absent,
+    disabled+blank/whitespace, enabled+missing-email, enabled+missing-password,
+    enabled+both, and DEVEX_ENABLED-absent→false cases.
+  - _Requirements: 5.1, 5.8, 5.9, 5.10_

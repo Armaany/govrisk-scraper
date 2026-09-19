@@ -617,7 +617,9 @@ portal-prefixed `opportunity_id` value (e.g. `samgov-ABC123`).
 @dataclass
 class Config:
     # ... existing fields unchanged ...
-    devex_enabled: bool = True                    # NEW
+    devex_email: str = ""                         # optional unless Devex enabled
+    devex_password: str = ""                      # optional unless Devex enabled
+    devex_enabled: bool = False                   # NEW (Devex is optional/off by default)
     samgov_api_key: Optional[str] = None          # NEW
     samgov_enabled: bool = False                  # NEW
     perplexity_api_key: Optional[str] = None      # NEW
@@ -627,7 +629,16 @@ class Config:
 `load_config()` additions:
 
 ```python
-devex_enabled = _parse_bool_env("DEVEX_ENABLED", True)
+# Devex is optional/off by default; parse the flag BEFORE validating creds.
+devex_enabled = _parse_bool_env("DEVEX_ENABLED", False)
+devex_email = os.getenv("DEVEX_EMAIL", "").strip()
+devex_password = os.getenv("DEVEX_PASSWORD", "").strip()
+if devex_enabled:
+    if not devex_email:
+        raise ValueError("Missing required environment variable: DEVEX_EMAIL")
+    if not devex_password:
+        raise ValueError("Missing required environment variable: DEVEX_PASSWORD")
+
 samgov_enabled = _parse_bool_env("SAM_GOV_ENABLED", False)
 samgov_api_key = os.getenv("SAM_GOV_API_KEY", "").strip() or None
 perplexity_enabled = _parse_bool_env("PERPLEXITY_ENABLED", False)
